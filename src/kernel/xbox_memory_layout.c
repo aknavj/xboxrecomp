@@ -14,10 +14,14 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "recomp_icall_feedback.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#if defined(_WIN32)
+#include <dbghelp.h>
+#endif
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
@@ -83,6 +87,7 @@ static void *g_tiled_view = NULL;
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+static LONG g_dma_banks[XBOX_CONTIG_SIZE / 4096];
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -876,6 +881,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (regs[0x008704 / 4] & 1u)
+            regs[0x008700 / 4] = 0;
+        regs[0x008100 / 4] = 0;
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -903,7 +911,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *
          * The advance now happens after the scan, further down, which is
          * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
@@ -951,32 +958,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                    uint32_t consumed = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+                    if (consumed != put)
+                        nv2a_pb_scan(XBOX_CONTIG_BASE | (consumed & 0x0FFFFFFFu),
+                                     XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                    if (last_put && put < last_put) {
                         if (getenv("RECOMP_PB_WRAP_TRACE")) {
                             static unsigned wraps;
                             if (wraps++ < 8)
@@ -1019,6 +1005,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 fflush(stderr);
             }
         }
+        fence_mirrors_tick();
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
@@ -1102,16 +1089,15 @@ static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS uint32_t g_eflags = 0x202u;
 
-#ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
  *
  * Those are callee-saved on x86, and the recompiler keeps them in globals, so
  * a function whose epilogue was never lifted corrupts its caller rather than
  * itself -- an error with no crash and no message, just less work silently
  * done. Ranked by hit count so the routine breaking a hot loop stands out from
- * the one-offs; -DRECOMP_ABI_CHECK only, since it costs three compares on
- * every indirect call.
+ * the one-offs. Automatic call checks remain gated by RECOMP_ABI_CHECK.
  */
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
@@ -1160,7 +1146,6 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     }
     hits[i]++;
 }
-#endif
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
@@ -1266,6 +1251,9 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+#if defined(_WIN32)
+static DWORD s_watchdog_thread_id;
+#endif
 
 /* Can RECOMP_PEEK dereference this guest address?
  *
@@ -1284,13 +1272,16 @@ static unsigned  s_watchdog_secs;
 static int peek_readable(uint32_t va)
 {
     struct { const void *mapped; uint32_t base; uint64_t size; } win[] = {
-        { g_memory_base,   XBOX_BASE_ADDRESS, (uint64_t)g_memory_size },
+        { g_memory_base,   XBOX_MAP_START,    (uint64_t)g_memory_size },
         { g_contig_memory, XBOX_CONTIG_BASE,  XBOX_CONTIG_SIZE },
         { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
         { g_mcpx_memory,   XBOX_MCPX_BASE,    XBOX_MCPX_SIZE },
         { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
     };
     size_t i;
+
+    if (va < XBOX_TIB_MAIN)
+        return 0;
 
     for (i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
         if (!win[i].mapped || !win[i].size)
@@ -1363,6 +1354,8 @@ static void watch_report(void)
      * is the next question every time -- saved registers and pointer
      * arguments live there and look nothing like code. */
     if (getenv("RECOMP_WATCH_RAW")) {
+        fprintf(stderr, "         regs edi=%08X esi=%08X ecx=%08X eax=%08X\n",
+            g_edi, g_esi, g_ecx, g_eax);
         for (i = 0; esp && i < 24u; i++) {
             uint32_t slot = esp + i * 4u;
             if (!peek_readable(slot))
@@ -1546,7 +1539,14 @@ void xbox_PeekSample(const char *label)
         int ok = 1;
 
         while (*q == '[') { derefs++; q++; }
-        va = strtoul(q, &end, 0);
+        if (strncmp(q, "esp", 3) == 0
+                && (q[3] == '\0' || q[3] == ',' || q[3] == '+'
+                    || q[3] == ']')) {
+            va = g_esp;
+            end = q + 3;
+        } else {
+            va = strtoul(q, &end, 0);
+        }
         if (end == q)
             break;
         while (*end == ']')
@@ -1611,6 +1611,45 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * CPU loop polling a global is exactly the case neither of those covers.
      */
     xbox_PeekSample("peek");
+#if defined(_WIN32) && defined(_WIN64)
+    {
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                   FALSE, s_watchdog_thread_id);
+        if (thread) {
+            CONTEXT ctx = {0};
+            uintptr_t rip = 0;
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            if (SuspendThread(thread) != (DWORD)-1) {
+                if (GetThreadContext(thread, &ctx))
+                    rip = (uintptr_t)ctx.Rip;
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+            if (rip) {
+                char buffer[sizeof(SYMBOL_INFO) + 128] = {0};
+                SYMBOL_INFO *sym = (SYMBOL_INFO *)buffer;
+                DWORD64 displacement = 0;
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 127;
+                fprintf(stderr, "  host RIP=0x%llX", (unsigned long long)rip);
+                if (SymFromAddr(GetCurrentProcess(), (DWORD64)rip,
+                                &displacement, sym))
+                    fprintf(stderr, " %s+0x%llX", sym->Name,
+                            (unsigned long long)displacement);
+                {
+                    IMAGEHLP_LINE64 line = {0};
+                    DWORD line_displacement = 0;
+                    line.SizeOfStruct = sizeof(line);
+                    if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)rip,
+                                 &line_displacement, &line))
+                    fprintf(stderr, " at %s:%lu", line.FileName,
+                        line.LineNumber);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+#endif
     /* The pushbuffer pointers, unconditionally.
      *
      * "Extend the table as more handshakes turn up -- run the title and the
@@ -1643,6 +1682,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    RECOMP_ICALL_FEEDBACK_DUMP();
     _exit(3);
     return 0;
 }
@@ -1665,6 +1705,9 @@ void xbox_WatchdogStart(void)
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
+#if defined(_WIN32)
+    s_watchdog_thread_id = GetCurrentThreadId();
+#endif
     h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
     if (h)
         CloseHandle(h);
@@ -1715,6 +1758,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* The mapped range, which is not necessarily RAM. Mirrors are placed
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */
+    memset(g_dma_banks, 0, sizeof(g_dma_banks));
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     /*
@@ -2296,9 +2340,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
-        s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+        s_nv2a_trace = 1;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -2373,22 +2415,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * the failure that gets further, with the correct behaviour one
              * variable away. */
             if (getenv("RECOMP_AC97_READY")) {
-                /* The APU's registers have to fault so they can be routed to
+                /* The modeled APU registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
                  * handshake. Backed as plain memory the guest's writes go
                  * nowhere the APU can see, so it initialises and then waits
-                 * forever. Only the APU's own 512K is unmapped: AC'97 above it
-                 * stays plain memory, which is what the codec-ready bit needs.
+                 * forever. Only main and VP registers are modeled; GP/EP
+                 * scratch memory remains readable for the guest's bulk copies.
+                 * AC'97 above the APU stays plain memory for the ready bit.
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
+                if (VirtualProtect((char *)g_mcpx_memory,
+                                   XBOX_MCPX_APU_MMIO_SIZE,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
+                            XBOX_MCPX_BASE, XBOX_MCPX_APU_MMIO_END);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
@@ -2969,6 +3013,54 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* MmGetPhysicalAddress supplies provenance for ordinary guest RAM buffers.
+ * Descriptor storage defaults to the separate contiguous DMA window. */
+void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical)
+{
+    if (physical >= XBOX_CONTIG_SIZE) return;
+    LONG bank;
+    if (guest_va >= XBOX_CONTIG_BASE &&
+        (uint64_t)guest_va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        bank = 2;
+    else if (guest_va && guest_va < g_memory_size)
+        bank = 1;
+    else
+        return;
+    InterlockedExchange(&g_dma_banks[physical / 4096], bank);
+}
+
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
+{
+    int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
+        physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (explicit_contiguous) physical -= XBOX_CONTIG_BASE;
+    if (!bytes || physical >= XBOX_CONTIG_SIZE ||
+        physical + bytes > XBOX_CONTIG_SIZE) {
+        fprintf(stderr, "[DMA] invalid physical extent: 0x%llX + %u\n",
+                (unsigned long long)physical, bytes);
+        return NULL;
+    }
+    LONG bank = explicit_contiguous ? 2 :
+        InterlockedCompareExchange(&g_dma_banks[physical / 4096], 0, 0);
+    for (uint64_t page = physical / 4096 + 1;
+         page <= (physical + bytes - 1) / 4096; page++) {
+        LONG next = explicit_contiguous ? 2 :
+            InterlockedCompareExchange(&g_dma_banks[page], 0, 0);
+        if ((next == 1) != (bank == 1)) {
+            fprintf(stderr, "[DMA] extent crosses RAM banks: 0x%llX + %u\n",
+                    (unsigned long long)physical, bytes);
+            return NULL;
+        }
+    }
+    if (bank == 1 && physical + bytes <= g_memory_size)
+        return (uint8_t *)((uintptr_t)g_memory_offset + (uintptr_t)physical);
+    if (bank != 1 && g_contig_memory)
+        return (uint8_t *)g_contig_memory + physical;
+    fprintf(stderr, "[DMA] physical storage unavailable: 0x%llX + %u\n",
+            (unsigned long long)physical, bytes);
+    return NULL;
 }
 
 

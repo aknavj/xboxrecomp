@@ -29,6 +29,19 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
+static APUPhysicalMemoryMapper g_apu_physical_mapper;
+
+uint8_t *mcpx_apu_ram_address(uint64_t physical, uint32_t bytes)
+{
+    if (g_apu_physical_mapper) {
+        uint8_t *pointer = g_apu_physical_mapper(physical, bytes);
+        if (pointer) return pointer;
+        fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
+                (unsigned long long)physical, bytes);
+        abort();
+    }
+    return g_apu_ram_ptr + (physical & 0x03FFFFFF);
+}
 
 MCPXAPUState *g_state = NULL;
 
@@ -189,7 +202,7 @@ static struct {
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define WAVEOUT_BUF_SAMPLES 256  /* One completed EP frame: 5.33ms at 48kHz */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 
 typedef struct {
@@ -202,6 +215,15 @@ typedef struct {
 } WaveOutState;
 
 static WaveOutState g_waveout = { 0 };
+#if defined(_WIN32)
+static bool g_audio_timer_started;
+#endif
+static struct {
+    bool failed;
+    uint64_t blocks, frames, nonzero, hardware_nonzero;
+    int peak;
+    unsigned long last_report;
+} g_audio_output;
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -209,6 +231,17 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+    memset(&g_audio_output, 0, sizeof(g_audio_output));
+#if defined(_WIN32)
+    if (!g_audio_timer_started) {
+        MMRESULT result = timeBeginPeriod(1);
+        if (result == TIMERR_NOERROR) {
+            g_audio_timer_started = true;
+        } else {
+            fprintf(stderr, "[APU] 1ms audio timer resolution unavailable (%u)\n", result);
+        }
+    }
+#endif
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
@@ -252,6 +285,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
+#if defined(_WIN32)
+    if (g_audio_timer_started) {
+        MMRESULT result = timeEndPeriod(1);
+        if (result != TIMERR_NOERROR)
+            fprintf(stderr, "[APU] timeEndPeriod failed (%u)\n", result);
+        g_audio_timer_started = false;
+    }
+#endif
     if (xa2_is_active()) {
         xa2_shutdown();
         return;
@@ -274,67 +315,20 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
-        }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+    if (g_audio_output.failed || (!xa2_is_active() && !g_waveout.initialized))
         return;
-    }
 
-    if (!g_waveout.initialized) return;
+    uint64_t hardware_nonzero = 0;
+    for (int i = 0; i < MIXER_FRAME_SAMPLES; i++)
+        for (int channel = 0; channel < 2; channel++)
+            hardware_nonzero += d->monitor.frame_buf[i][channel] != 0;
 
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-        qemu_mutex_unlock(&d->lock);
-        Sleep(1);
-        qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
-    }
-
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
+    /* The DSP has already assembled eight 32-sample VP slices here. */
+    if (g_audio_muted) {
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
+    } else {
+        if (g_test_tone.active) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
                 int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
                 d->monitor.frame_buf[i][0] = s;
                 d->monitor.frame_buf[i][1] = s;
@@ -343,23 +337,77 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
+        mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
     }
 
-    /* Submit to waveOut */
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+    unsigned long deadline = (unsigned long)GetTickCount();
+    if (xa2_is_active()) {
+        int submitted;
+        while ((submitted = xa2_submit_samples(
+                    (const int16_t *)d->monitor.frame_buf, MIXER_FRAME_SAMPLES)) == 0) {
+            if (qatomic_read(&d->exiting) ||
+                (d->pause_requested && !g_mixer_active_count && !g_test_tone.active))
+                return;
+            if ((unsigned long)GetTickCount() - deadline >= 2000) {
+                fprintf(stderr, "[APU] XAudio2 queue stalled; audio output stopped\n");
+                g_audio_output.failed = true;
+                return;
+            }
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
+        if (submitted < 0) {
+            g_audio_output.failed = true;
+            return;
+        }
+    } else {
+        int idx = g_waveout.next_buf;
+        WAVEHDR *hdr = &g_waveout.hdrs[idx];
+        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+            if (qatomic_read(&d->exiting) ||
+                (d->pause_requested && !g_mixer_active_count && !g_test_tone.active))
+                return;
+            if ((unsigned long)GetTickCount() - deadline >= 2000) {
+                fprintf(stderr, "[APU] waveOut queue stalled; audio output stopped\n");
+                g_audio_output.failed = true;
+                return;
+            }
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
+        memcpy(g_waveout.bufs[idx], d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+        MMRESULT result = waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+        if (result != MMSYSERR_NOERROR) {
+            fprintf(stderr, "[APU] waveOutWrite failed (%u); audio output stopped\n", result);
+            g_audio_output.failed = true;
+            return;
+        }
+        g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+        g_waveout.frames_written++;
+    }
 
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
+    g_audio_output.blocks++;
+    g_audio_output.frames += MIXER_FRAME_SAMPLES;
+    g_audio_output.hardware_nonzero += hardware_nonzero;
+    for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+        for (int channel = 0; channel < 2; channel++) {
+            int amplitude = abs(d->monitor.frame_buf[i][channel]);
+            g_audio_output.nonzero += amplitude != 0;
+            if (amplitude > g_audio_output.peak) g_audio_output.peak = amplitude;
+        }
+    }
+    static int diagnostic = -1;
+    if (diagnostic < 0) diagnostic = getenv("RECOMP_APU_DIAG") != NULL;
+    unsigned long now = (unsigned long)GetTickCount();
+    if (diagnostic && now - g_audio_output.last_report >= 1000) {
+        g_audio_output.last_report = now;
+        fprintf(stderr, "[APU-OUT] %s blocks=%llu frames=%llu nonzero=%llu "
+                        "hardware_nonzero=%llu peak=%d tone=%d muted=%d\n",
+                xa2_is_active() ? "XAudio2" : "waveOut",
+                (unsigned long long)g_audio_output.blocks,
+                (unsigned long long)g_audio_output.frames,
+                (unsigned long long)g_audio_output.nonzero,
+                (unsigned long long)g_audio_output.hardware_nonzero,
+                g_audio_output.peak, g_test_tone.active, g_audio_muted);
+    }
 }
 
 /* ============================================================
@@ -451,6 +499,9 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
+        /* DSP command servicing is independent of the voice front end. */
+        mcpx_apu_dsp_ack_frame(d);
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -463,6 +514,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -517,6 +569,12 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+    return mcpx_apu_init_standalone_mapped(ram_ptr, NULL);
+}
+
+MCPXAPUState *mcpx_apu_init_standalone_mapped(
+    uint8_t *ram_ptr, APUPhysicalMemoryMapper mapper)
+{
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -524,6 +582,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+    g_apu_physical_mapper = mapper;
     g_state = d;
     d->ram_ptr = ram_ptr;
 

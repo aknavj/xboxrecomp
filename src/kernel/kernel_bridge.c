@@ -1849,6 +1849,9 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
     recomp_func_t fn;
+    static int trace = -1;
+    static unsigned trace_count;
+    if (trace < 0) trace = getenv("RECOMP_USB_TRACE") != NULL;
 
     if (!dpc_va)
         return 0;
@@ -1868,6 +1871,9 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
+    if (trace && trace_count++ < 32)
+        fprintf(stderr, "  [KERNEL-DPC] routine=%08X context=%08X args=%08X/%08X\n",
+                routine, context, arg1, arg2);
 
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
@@ -2869,9 +2875,13 @@ static void bridge_NtCreateFile(void)
             n++;
         }
         host[n] = 0;
-        if (n > 4 && _stricmp(host + n - 4, ".wmv") == 0
-                && !xbox_VideoIsPlaying())
+        if (n > 4
+            && (_stricmp(host + n - 4, ".wmv") == 0
+                || _stricmp(host + n - 4, ".vid") == 0)
+                && !xbox_VideoIsPlaying()) {
+            fprintf(stderr, "  [VIDEO] host fallback requested: %s\n", host);
             xbox_VideoPlayFile(host);
+        }
     }
 
     /* Paired with the [PATH] line the translation just printed: that says what
@@ -3205,15 +3215,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X buffer=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
-                    (long long)off.QuadPart, length, got,
+                buffer_va, (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller,
+            fprintf(stderr, "  [READ] from=0x%08X buffer=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                g_xbox_kernel_caller, buffer_va,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -9037,8 +9047,19 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
+                fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X ret=0x%08X lock=0x%08X\n",
+                    g_kernel_call_count, ordinal, slot, g_esp,
+                    g_esp ? BRIDGE_MEM32(g_esp) : 0,
+                    (ordinal == 277 || ordinal == 294) && g_esp
+                    ? BRIDGE_MEM32(g_esp + 4) : 0);
+            if (getenv("RECOMP_KERNEL_STACK") && g_esp >= 0x1000u
+                    && g_esp <= 0x04000000u - 64u) {
+                uint32_t stack_word;
+                fprintf(stderr, "  [KERNEL] stack:");
+                for (stack_word = 0; stack_word < 16; stack_word++)
+                    fprintf(stderr, " %08X", BRIDGE_MEM32(g_esp + stack_word * 4u));
+                fprintf(stderr, "\n");
+            }
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and

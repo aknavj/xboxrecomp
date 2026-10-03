@@ -19,6 +19,7 @@
 
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
 
 /* Calling the title's interrupt service routine.
  *
@@ -391,6 +392,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_DP_IN       2u
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
+#define TD_CC_BUFFER_OVERRUN 12u
 
 
 static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
@@ -429,6 +431,8 @@ static int guest_ok(uint32_t va, uint32_t bytes)
 
     if (va == 0 || mapped == 0)
         return 0;
+    if (va < OHCI_CONTIG_SIZE)
+        return (uint64_t)va + bytes <= OHCI_CONTIG_SIZE;
     /* Descriptors live where a driver puts DMA memory, and on Xbox that is
      * MmAllocateContiguousMemory -- the contiguous window, not low RAM. The
      * bound below reads as "is this in RAM", which is not the question: the
@@ -444,22 +448,26 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
+static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+{
+    if (!guest_ok(va, bytes))
+        return NULL;
+    /* OHCI registers and descriptor links contain physical DMA addresses.
+     * Low XBE RAM is separate storage in this runtime, not a DMA alias. */
+    if (va < OHCI_CONTIG_SIZE)
+        va |= OHCI_CONTIG_BASE;
+    return (uint8_t *)xbox_GetMemoryOffset() + va;
+}
+
 static uint32_t rd32(uint32_t va)
 {
-    if (!guest_ok(va, 4))
-        return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    uint8_t *p = guest_ptr(va, 4);
+    return p ? *(uint32_t *)p : 0;
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    if (!guest_ok(va, 4))
-        return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
-}
-static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
-{
-    return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+    uint8_t *p = guest_ptr(va, 4);
+    if (p) *(uint32_t *)p = v;
 }
 
 /* Move one transfer descriptor. Returns the condition code to report. */
@@ -469,6 +477,9 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     uint32_t cbp  = rd32(td + 4);
     uint32_t be   = rd32(td + 12);
     uint32_t dp   = (info >> 19) & 3u;
+    uint32_t direction = (ed0 >> 11) & 3u;
+    if (direction == TD_DP_IN || direction == TD_DP_OUT)
+        dp = direction;
     int      len  = (cbp && be >= cbp) ? (int)(be - cbp + 1) : 0;
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
@@ -485,8 +496,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     if (dp == TD_DP_SETUP) {
         /* Eight bytes of setup, kept for the data stage that follows. */
         if (len >= 8) {
-            const uint8_t *p = guest_ptr(cbp, 8);
-            if (!p) return TD_CC_NOERROR;
+            const uint8_t *p = xbox_DmaPhysicalPointer(cbp, 8);
+            if (!p) return TD_CC_BUFFER_OVERRUN;
             g_setup.bmRequestType = p[0];
             g_setup.bRequest      = p[1];
             g_setup.wValue        = (uint16_t)(p[2] | (p[3] << 8));
@@ -537,9 +548,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             n = g_ctrl_len - g_ctrl_sent;
             if (n > len) n = len;
             if (n < 0) n = 0;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n),
-                       g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            if (n > 0) {
+                uint8_t *p = xbox_DmaPhysicalPointer(cbp, (uint32_t)n);
+                if (!p) return TD_CC_BUFFER_OVERRUN;
+                memcpy(p, g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            }
             g_ctrl_sent += n;
             moved = n;
             if (s_trace && n > 0) {
@@ -552,8 +565,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             uint8_t rep[32];
             int n = usb_gamepad_report(rep, (int)sizeof rep);
             if (n > len) n = len;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
+            if (n > 0) {
+                uint8_t *p = xbox_DmaPhysicalPointer(cbp, (uint32_t)n);
+                if (!p) return TD_CC_BUFFER_OVERRUN;
+                memcpy(p, rep, (size_t)n);
+            }
             moved = n;
         }
     } else {
@@ -635,15 +651,9 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
 }
 
-static int ohci_run_control_list(OhciController *hc)
+static int ohci_run_control_list(OhciController *hc, uint32_t *done_head)
 {
-    uint32_t done_head = 0;
-    int completed = ohci_walk_eds(hc,
-            hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, &done_head);
-
-    if (completed)
-        ohci_publish_done(hc, done_head);
-    return completed;
+    return ohci_walk_eds(hc, hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, done_head);
 }
 
 /* The periodic list for the current frame.
@@ -652,10 +662,9 @@ static int ohci_run_control_list(OhciController *hc)
  * services the one the frame number selects. An interrupt endpoint polled
  * every 4 ms appears in several slots, so cycling through them the way the
  * frame counter does is what makes its transfers happen at all. */
-static int ohci_run_periodic_list(OhciController *hc)
+static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
-    uint32_t done_head = 0;
     uint32_t slot, ed;
     int completed;
 
@@ -684,10 +693,8 @@ static int ohci_run_periodic_list(OhciController *hc)
                     "info=%08X\n", hc->index, slot, ed, rd32(ed));
             fflush(stderr);
         }
-        completed += ohci_walk_eds(hc, ed, &done_head);
+        completed += ohci_walk_eds(hc, ed, done_head);
     }
-    if (completed)
-        ohci_publish_done(hc, done_head);
     return completed;
 }
 
@@ -879,6 +886,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     for (;;) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
+        uint32_t done_head = 0;
+        int completed = 0;
 
         Sleep(OHCI_TICK_MS);
         control = hc->reg[HcControl / 4];
@@ -887,8 +896,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            ++waited;
             continue;
         }
         if (!(enable & INTR_MIE))
@@ -911,7 +919,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port %u\n", waited * 20, port + 1);
             fflush(stderr);
         }
 
@@ -970,7 +978,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         hc->index, control, hc->reg[HcHCCA / 4]);
                 fflush(stderr);
             }
-            ohci_run_periodic_list(hc);
+            completed += ohci_run_periodic_list(hc, &done_head);
         }
 
         /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
@@ -978,19 +986,25 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * there is owed the same service. */
         if ((control & 0x20u)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
-            uint32_t done_head = 0;
-            if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
-                              &done_head)) {
-                ohci_publish_done(hc, done_head);
+            int bulk_completed = ohci_walk_eds(hc,
+                hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, &done_head);
+            if (bulk_completed) {
+                completed += bulk_completed;
                 hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
             }
         }
 
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
-            if (ohci_run_control_list(hc))
+            int control_completed = ohci_run_control_list(hc, &done_head);
+            if (control_completed) {
+                completed += control_completed;
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+            }
         }
+        /* One writeback preserves completions from all lists in this tick. */
+        if (completed)
+            ohci_publish_done(hc, done_head);
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so

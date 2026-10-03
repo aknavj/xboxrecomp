@@ -391,20 +391,14 @@ _EFLAGS_SETTERS = frozenset({
     "bt", "bts", "btr", "btc",  # Bit test sets CF
     "cmpxchg",           # Compare-and-exchange sets ZF
     "xadd",              # Exchange-and-add sets flags
+    "popfd",
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
-    "rdtsc", "cpuid",      # Special instructions
+    "rdtsc",              # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
-    # popfd REPLACES every flag with whatever was pushed. Its flags are not
-    # architecturally undefined -- they are simply not knowable from the
-    # instruction stream -- but the tracking action is the same: whatever the
-    # last comparison left is gone, and a jcc after it must not be resolved
-    # from that comparison. It used to sit in _EFLAGS_PRESERVE, next to
-    # pushfd, which does read-and-preserve and does belong there.
-    "popfd",
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -424,7 +418,7 @@ _EFLAGS_PRESERVE = frozenset({
     "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
     # popfd does NOT -- see _FLAGS_UNDEFINED.
-    "pushfd", "pushal",
+    "pushfd", "pushal", "pushad", "popal", "popad", "cpuid",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -501,6 +495,33 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
     cmp_macro, test_macro, desc = cond_info
 
+    if flag_setter == "popfd":
+        carry = "((g_eflags & 1u) != 0)"
+        zero = "((g_eflags & 0x40u) != 0)"
+        sign = "((g_eflags & 0x80u) != 0)"
+        overflow = "((g_eflags & 0x800u) != 0)"
+        conditions = {
+            "CMP_EQ": zero, "CMP_NE": f"!{zero}",
+            "CMP_B": carry, "CMP_AE": f"!{carry}",
+            "CMP_BE": f"({carry} || {zero})",
+            "CMP_A": f"(!{carry} && !{zero})",
+            "CMP_L": f"({sign} != {overflow})",
+            "CMP_GE": f"({sign} == {overflow})",
+            "CMP_LE": f"({zero} || {sign} != {overflow})",
+            "CMP_G": f"(!{zero} && {sign} == {overflow})",
+            "CMP_S": sign, "CMP_NS": f"!{sign}",
+            "CMP_O": overflow, "CMP_NO": f"!{overflow}",
+            "CMP_P": "((g_eflags & 4u) != 0)",
+            "CMP_NP": "((g_eflags & 4u) == 0)",
+        }
+        condition = conditions.get(cmp_macro) or {
+            "js": sign, "jns": f"!{sign}",
+            "jo": overflow, "jno": f"!{overflow}",
+            "jp": "((g_eflags & 4u) != 0)",
+            "jnp": "((g_eflags & 4u) == 0)",
+        }.get(jcc)
+        return (condition, desc) if condition else None
+
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
     #
@@ -564,11 +585,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         }
         op = fpu_cmp_map.get(jcc)
         if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
+            unordered_true = jcc in ("jb", "jnae", "jc", "jbe", "jna", "je", "jz")
+            unordered = "|| g_fp_cmp == 2" if unordered_true else "&& g_fp_cmp != 2"
+            return f"(g_fp_cmp {op} 0 {unordered}) /* {flag_setter} */", desc
         if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
+            return "(g_fp_cmp == 2)", desc
         if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+            return "(g_fp_cmp != 2)", desc
+        if jcc in ("js", "jo"):
+            return "0", desc
+        if jcc in ("jns", "jno"):
+            return "1", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition
@@ -602,17 +629,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"({a} < {b} || {a} != {a} || {b} != {b})", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"({a} <= {b} || {a} != {a} || {b} != {b})", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"({a} == {b} || {a} != {a} || {b} != {b})", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
+            return f"({a} != {b} && {a} == {a} && {b} == {b})", desc
         if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
+            return f"({a} != {a} || {b} != {b})", desc
         if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} == {a} && {b} == {b})", desc
+        if jcc in ("js", "jo"):
+            return "0", desc
+        if jcc in ("jns", "jno"):
+            return "1", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -1372,6 +1403,36 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+        if m == "pushfd":
+            return ["PUSH32(esp, (g_eflags & ~0x400u) | 2u |"
+                    " (g_df ? 0x400u : 0u));"]
+        if m == "popfd":
+            out = ["POP32(esp, g_eflags);", "g_eflags |= 2u;",
+                   "g_df = (g_eflags & 0x400u) != 0;"]
+            if self.needs_cf:
+                out.append("_cf = g_eflags & 1u;")
+            return out
+        if m == "cpuid":
+            return ["if (eax == 0u) {",
+                    "    eax = 1u; ebx = 0x756E6547u;",
+                    "    edx = 0x49656E69u; ecx = 0x6C65746Eu;",
+                    "} else if (eax == 1u) {",
+                    "    eax = 0x0000068Au; ebx = 0u;",
+                    "    ecx = 0u; edx = 0x0383F9FFu;",
+                    "} else {",
+                    "    eax = 0u; ebx = 0u; ecx = 0u; edx = 0u;",
+                    "}"]
+        if m in ("pushal", "pushad"):
+            return ["{ uint32_t saved_esp = esp;",
+                    "PUSH32(esp, eax); PUSH32(esp, ecx);",
+                    "PUSH32(esp, edx); PUSH32(esp, ebx);",
+                    "PUSH32(esp, saved_esp); PUSH32(esp, ebp);",
+                    "PUSH32(esp, esi); PUSH32(esp, edi); }"]
+        if m in ("popal", "popad"):
+            return ["POP32(esp, edi); POP32(esp, esi);",
+                    "POP32(esp, ebp); esp += 4;",
+                    "POP32(esp, ebx); POP32(esp, edx);",
+                    "POP32(esp, ecx); POP32(esp, eax);"]
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -1523,7 +1584,7 @@ class Lifter:
         if m in ("cld", "std"):
             return [f"g_df = {0 if m == 'cld' else 1}; /* {m} */"]
         if m == "lahf":
-            return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
+            return ["SET_HI8(eax, (g_eflags & 0xD5u) | 2u); /* lahf */"]
         if m == "sahf":
             return ["/* sahf - store AH to flags */"]
         if m == "shld":
@@ -1789,7 +1850,11 @@ class Lifter:
         if len(ops) < 2 or ops[1].type != "mem":
             return [f"/* lea: unexpected operands */"]
         addr_expr = _fmt_mem(ops[1])
-        return [_fmt_operand_write(ops[0], addr_expr)]
+        out = [_fmt_operand_write(ops[0], addr_expr)]
+        if (ops[0].type == "reg" and ops[0].reg == "ebp"
+                and ops[1].mem_base == "esp" and not ops[1].mem_index):
+            out.extend(["g_ebp = ebp;", "g_seh_ebp = ebp;"])
+        return out
 
     def _lift_xchg(self, insn, ops):
         if len(ops) < 2:
@@ -2450,7 +2515,7 @@ class Lifter:
         """Check if a jump target is outside the current function."""
         return not (self.func_start <= addr < self.func_end)
 
-    def _read_jump_table(self, table_va, max_entries=256):
+    def _read_jump_table(self, table_va, max_entries=256, step=4):
         """Read 32-bit jump table entries from the XBE at a given VA.
         Returns list of target addresses. Stops when an entry is not a
         valid code address or max_entries is reached."""
@@ -2461,8 +2526,8 @@ class Lifter:
             return []
         targets = []
         for i in range(max_entries):
-            o = offset + i * 4
-            if o + 4 > len(self.xbe_data):
+            o = offset + i * step
+            if o < 0 or o + 4 > len(self.xbe_data):
                 break
             val = struct.unpack_from('<I', self.xbe_data, o)[0]
             if not is_code_address(val):
@@ -2485,6 +2550,21 @@ class Lifter:
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
             targets = self._read_jump_table(table_va)
+            aligned_end = (self.func_end + 3) & ~3
+            if ((self.func_start <= table_va < self.func_end
+                    or table_va == aligned_end)
+                    and op.mem_index and op.mem_scale == 4
+                    and not op.mem_base):
+                scans = [targets]
+                if not targets:
+                    scans.append(self._read_jump_table(table_va + 4))
+                scans.append(self._read_jump_table(table_va - 4, step=-4))
+                targets = []
+                for scan in scans:
+                    for target in scan:
+                        if not (self.func_start <= target < self.func_end):
+                            break
+                        targets.append(target)
         if not targets:
             return []
         # Truncate at the first entry outside the function rather than
@@ -3846,6 +3926,18 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
+        if curr.mnemonic in ("pushfd", "lahf") and last_flag_setter:
+            for jump, bit in (("jb", 1), ("jp", 4), ("je", 0x40),
+                              ("js", 0x80), ("jo", 0x800)):
+                condition = _make_condition(jump, last_flag_setter,
+                                            last_flag_ops)
+                if condition:
+                    stmts.append(f"g_eflags = (g_eflags & ~0x{bit:X}u) |"
+                                 f" (({condition[0]}) ? 0x{bit:X}u : 0u);")
+            if last_flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd",
+                                    "fcompi", "fcomip", "fucomi", "fucompi",
+                                    "fucomip", "fcomi"):
+                stmts.append("g_eflags &= ~0x10u; /* float compare clears AF */")
         stmts.extend(results)
 
         # Track flag-setting instructions
