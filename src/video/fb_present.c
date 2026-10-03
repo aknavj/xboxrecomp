@@ -23,6 +23,7 @@
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+int xbox_FramebufferDumpBmp(const char *path);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -128,6 +129,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F12) {
+            const char *path = getenv("RECOMP_FB_CAPTURE");
+            if (!path || !path[0]) path = "framebuffer.bmp";
+            if (xbox_FramebufferDumpBmp(path) != 0)
+                fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -215,9 +223,11 @@ int xbox_FramebufferDumpBmp(const char *path)
     memcpy(hdr + 22, &s_fb_height, 4);
     hdr[26] = 1; hdr[28] = 24;
     memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
-
     line = (uint8_t *)calloc(1, row);
+    if (!line) { fclose(f); return -1; }
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        free(line); fclose(f); return -1;
+    }
     for (y = 0; y < s_fb_height; y++) {
         const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
         for (x = 0; x < s_fb_width; x++) {
@@ -225,10 +235,12 @@ int xbox_FramebufferDumpBmp(const char *path)
             line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
             line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
         }
-        fwrite(line, 1, row, f);
+        if (fwrite(line, 1, row, f) != row) {
+            free(line); fclose(f); return -1;
+        }
     }
     free(line);
-    fclose(f);
+    if (fclose(f) != 0) return -1;
     fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
             path, s_fb_width, s_fb_height, s_fb_va);
     return 0;
@@ -240,6 +252,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     HDC hdc;
     BITMAPINFO bi;
     RECT r;
+    const char *window_title = getenv("RECOMP_WINDOW_TITLE");
 
     (void)unused;
 
@@ -254,7 +267,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
+                           window_title && window_title[0] ? window_title : "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
@@ -305,29 +319,6 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
-        {
-            /* One dump a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame.
-             *
-             * RECOMP_FB_WINDOW_DUMP_EVERY=<frames> dumps repeatedly instead.
-             * This window follows the address AvSetDisplayMode gave, which is
-             * what the CRTC scans and therefore what a person sees; the
-             * pushbuffer executor's own dump follows its draw surface. With
-             * double buffering those are different buffers, and measuring
-             * progress from the executor's dump reports a blank screen while
-             * the window is showing the title's logo. Ask the window. */
-            const char *dump = getenv("RECOMP_FB_DUMP");
-            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
-            static int frames;
-            int period = every ? atoi(every) : 0;
-            frames++;
-            if (dump && period > 0) {
-                if (frames % period == 0)
-                    xbox_FramebufferDumpBmp(dump);
-            } else if (dump && frames == 600) {
-                xbox_FramebufferDumpBmp(dump);
-            }
-        }
         Sleep(16);
     }
 
@@ -342,8 +333,6 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
-        return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);

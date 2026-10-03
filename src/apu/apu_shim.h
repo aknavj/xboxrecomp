@@ -94,33 +94,34 @@ static inline void qemu_thread_join(QemuThread *t) {
  * ============================================================ */
 
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+uint8_t *mcpx_apu_ram_address(uint64_t physical, uint32_t bytes);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)mcpx_apu_ram_address(addr, 4);
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)mcpx_apu_ram_address(addr, 2);
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *mcpx_apu_ram_address(addr, 1);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)mcpx_apu_ram_address(addr, 4) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)mcpx_apu_ram_address(addr, 2) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *mcpx_apu_ram_address(addr, 1) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
