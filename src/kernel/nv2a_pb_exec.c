@@ -99,12 +99,9 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  */
 static uint32_t dma_resolve(uint32_t offset)
 {
-    extern uint32_t xbox_ContiguousAllocatedBytes(void);
-
     /* Did this runtime hand the offset out as contiguous memory? Then the
-     * bytes live in the window, and that is not a guess: the arena is a bump
-     * allocator from XBOX_CONTIG_BASE, so everything below its high-water
-     * mark is memory some MmAllocateContiguousMemory call returned. The
+     * bytes live in the window. Check live allocation ownership rather than
+     * a high-water mark: freed pages and alignment gaps are not allocations. The
      * title's own writes go through the window, so the executor's must too.
      *
      * Checking this BEFORE the image test is the whole point. The image test
@@ -115,7 +112,8 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < xbox_ContiguousAllocatedBytes())
+    if (offset < XBOX_CONTIG_SIZE
+            && xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset))
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
         return offset;
@@ -286,6 +284,7 @@ static struct {
     uint32_t window_clip_horizontal[8], window_clip_vertical[8];
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    uint32_t semaphore_context, semaphore_offset;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -350,6 +349,77 @@ static struct {
 typedef struct { uint32_t subchannel, method, count, last_param; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
+
+int xbox_Nv2aNativeFencesEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_NV2A_NATIVE_FENCES");
+        enabled = value != NULL && strcmp(value, "0") != 0;
+    }
+    return enabled;
+}
+
+static int ramht_instance(uint32_t handle, uint32_t *instance)
+{
+    volatile uint32_t *fifo = xbox_Nv2aRegisterPointer(0x2000, 0x1208);
+    volatile uint32_t *ramin = xbox_Nv2aRegisterPointer(0x700000, 0x100000);
+    if (!fifo || !ramin)
+        goto failure;
+    uint32_t ramht = fifo[0x210 / 4];
+    uint32_t first = ((ramht & 0x1F0u) << 8) / 4;
+    uint32_t count = (4096u << ((ramht >> 16) & 3u)) / 4;
+    uint32_t channel = fifo[0x1204 / 4] & 31u;
+    for (uint32_t i = first; i < first + count; i += 2) {
+        uint32_t candidate = ramin[i + 1];
+        if (ramin[i] == handle &&
+                (candidate & 0x80000000u) &&
+                ((candidate >> 24) & 31u) == channel) {
+            *instance = (candidate & 0xFFFFu) << 4;
+            return 1;
+        }
+    }
+failure:
+    fprintf(stderr, "[GPU] RAMHT object unavailable: handle 0x%08X\n", handle);
+    return 0;
+}
+
+static void semaphore_release(uint32_t value)
+{
+    uint32_t instance;
+    if (!ramht_instance(s_gpu.semaphore_context, &instance))
+        goto failure;
+    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + instance, 12);
+    if (!descriptor)
+        goto failure;
+    uint32_t flags = descriptor[0];
+    uint32_t limit = descriptor[1];
+    uint32_t frame = descriptor[2];
+    uint32_t dma_class = flags & 0xFFFu;
+    uint32_t target = flags & 0x30000u;
+    uint64_t address = (frame & 0xFFFFF000u) + (flags >> 20);
+    address += s_gpu.semaphore_offset;
+    if ((dma_class != 0x03u && dma_class != 0x3Du) ||
+            (target != 0 && target != 0x20000u) || (address & 3u) ||
+            (uint64_t)s_gpu.semaphore_offset + 4 > (uint64_t)limit + 1) {
+        fprintf(stderr, "[GPU] invalid semaphore DMA descriptor: instance 0x%05X flags 0x%08X limit 0x%08X frame 0x%08X\n",
+                instance, flags, limit, frame);
+        goto failure;
+    }
+    uint8_t *destination = xbox_DmaPhysicalPointer(address, 4);
+    if (!destination)
+        goto failure;
+    /* Retire the command's value, not a concurrently advanced CPU counter. */
+    nv2a_pb_exec_flush();
+    *(volatile uint32_t *)destination = value;
+    return;
+
+failure:
+    fprintf(stderr, "[GPU] semaphore release failed: handle 0x%08X offset 0x%08X value 0x%08X\n",
+            s_gpu.semaphore_context, s_gpu.semaphore_offset, value);
+    fflush(stderr);
+    _Exit(EXIT_FAILURE);
+}
 
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
@@ -1872,6 +1942,7 @@ typedef struct {
     Texture texture;
     uint32_t face_stride;
     uint32_t bytes_per_pixel, mip_levels;
+    uint32_t depth;
 } GpuCubeTexture;
 
 static int gpu_decode_cube_texture(void *context, uint32_t face, uint32_t horizontal, uint32_t vertical, uint32_t *color)
@@ -1899,6 +1970,42 @@ static int gpu_decode_mip_texture(void *context, uint32_t face, uint32_t level,
         else offset += (uint64_t)texture.width * texture.height * binding->bytes_per_pixel;
         if (texture.width > 1) texture.width >>= 1;
         if (texture.height > 1) texture.height >>= 1;
+    }
+    if (offset > UINT32_MAX) return 0;
+    texture.offset = (uint32_t)offset;
+    return sample_texture_bound(&texture, horizontal, vertical, color);
+}
+
+static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t horizontal,
+                                     uint32_t vertical, uint32_t slice, uint32_t *color)
+{
+    const GpuCubeTexture *binding = (const GpuCubeTexture *)context;
+    Texture texture = binding->texture;
+    uint32_t depth = binding->depth;
+    uint32_t block_bytes = d3d8_format_dxt_block_bytes(texture.color);
+    uint64_t offset = texture.offset, slice_bytes;
+    if (level >= binding->mip_levels) return 0;
+    for (uint32_t previous = 0; ; previous++) {
+        slice_bytes = block_bytes ?
+            (uint64_t)((texture.width + 3) / 4) * ((texture.height + 3) / 4) * block_bytes :
+            tex_size_from_format(texture.color) ? (uint64_t)texture.width * texture.height * binding->bytes_per_pixel :
+            (uint64_t)texture.pitch * texture.height;
+        if (previous == level) break;
+        offset += slice_bytes * depth;
+        if (texture.width > 1) texture.width >>= 1;
+        if (texture.height > 1) texture.height >>= 1;
+        if (depth > 1) depth >>= 1;
+    }
+    if (horizontal >= texture.width || vertical >= texture.height || slice >= depth) return 0;
+    if (!block_bytes && d3d8_format_is_swizzled(texture.color)) {
+        offset += (uint64_t)swizzle_volume_offset(horizontal, vertical, slice,
+            texture.width, texture.height, depth) * binding->bytes_per_pixel;
+        texture.color = linear_twin(texture.color);
+        texture.width = texture.height = 1;
+        texture.pitch = binding->bytes_per_pixel;
+        horizontal = vertical = 0;
+    } else {
+        offset += slice_bytes * slice;
     }
     if (offset > UINT32_MAX) return 0;
     texture.offset = (uint32_t)offset;
@@ -2097,8 +2204,11 @@ static int gpu_raster_batch(void)
         binding->filter = texture->filter;
         if (!nv2a_gpu_texture_mode_samples(mode)) continue;
         if (!nv2a_gpu_texture_enabled(binding)) return gpu_batch_rejected("disabled texture used by sampling shader mode");
-        if (((texture->raw_format >> 4) & 15u) == 3u) return gpu_batch_rejected("volume texture storage");
         if (!texture->valid) return gpu_batch_rejected("invalid texture binding");
+        if (((texture->raw_format >> 4) & 15u) == 3u)
+            binding->depth = 1u << (texture->raw_format >> 28);
+        if ((mode == 2) != (binding->depth != 0) || (binding->depth && (texture->raw_format & 4u)))
+            return gpu_batch_rejected("projective volume texture dimensionality");
         binding->source = memory + texture->offset; binding->width = texture->width; binding->height = texture->height;
         binding->pitch = texture->pitch; binding->format = texture->color; binding->linear = !tex_size_from_format(texture->color);
         binding->address_u = texture->addr_u; binding->address_v = texture->addr_v;
@@ -2110,6 +2220,7 @@ static int gpu_raster_batch(void)
         binding->mip_levels = (texture->raw_format >> 16) & 15u;
         if (!binding->mip_levels) binding->mip_levels = 1;
         uint32_t maximum_levels = 1, maximum_dimension = texture->width > texture->height ? texture->width : texture->height;
+        if (binding->depth > maximum_dimension) maximum_dimension = binding->depth;
         while (maximum_dimension > 1) { maximum_dimension >>= 1; maximum_levels++; }
         if (binding->mip_levels > maximum_levels || (binding->linear && binding->mip_levels != 1))
             return gpu_batch_rejected("texture mip count or linear mip layout");
@@ -2125,18 +2236,21 @@ static int gpu_raster_batch(void)
             bytes = binding->linear ? (uint64_t)texture->pitch * texture->height :
                 (uint64_t)texture->width * texture->height * bytes_per_pixel;
         }
-        uint64_t face_bytes = bytes;
+        uint64_t face_bytes = bytes * (binding->depth ? binding->depth : 1u);
         for (uint32_t level = 1; level < binding->mip_levels; level++) {
             uint32_t width = texture->width >> level, height = texture->height >> level;
             if (!width) width = 1;
             if (!height) height = 1;
-            if (block_bytes) face_bytes += (uint64_t)((width + 3) / 4) * ((height + 3) / 4) * block_bytes;
-            else face_bytes += (uint64_t)width * height * bytes_per_pixel;
+            uint32_t depth = binding->depth >> level;
+            if (!depth) depth = 1;
+            if (block_bytes) face_bytes += (uint64_t)((width + 3) / 4) * ((height + 3) / 4) * block_bytes * depth;
+            else face_bytes += (uint64_t)width * height * bytes_per_pixel * depth;
         }
         cube_textures[stage].texture = *texture;
         cube_textures[stage].bytes_per_pixel = bytes_per_pixel;
         cube_textures[stage].mip_levels = binding->mip_levels;
         cube_textures[stage].face_stride = 0;
+        cube_textures[stage].depth = binding->depth;
         bytes = face_bytes;
         if (texture->raw_format & 4u) {
             if (texture->width != texture->height || binding->linear) {
@@ -2153,6 +2267,10 @@ static int gpu_raster_batch(void)
         }
         if (binding->mip_levels > 1) {
             binding->decode_context = &cube_textures[stage]; binding->decode_level = gpu_decode_mip_texture;
+        }
+        if (binding->depth) {
+            binding->decode_context = &cube_textures[stage];
+            binding->decode_volume = gpu_decode_volume_texture;
         }
         if (!bytes || (uint64_t)physical_alias(texture->offset) + bytes > XBOX_CONTIG_SIZE) return gpu_batch_rejected("texture memory extent");
         binding->source_bytes = (uint32_t)bytes;
@@ -2268,6 +2386,12 @@ static void raster_batch(void)
 #ifdef _WIN32
     if (gpu_raster_batch()) return;
     fprintf(stderr, "[GPU-D3D11] unsupported batch: primitive %u count %u; hardware rendering required\n", s_gpu.prim, s_gpu.idx_count);
+    for (uint32_t i = 0; i < 4; i++) {
+        const Texture *texture = i ? &s_gpu.extra_tex[i - 1] : &s_gpu.tex;
+        fprintf(stderr, "[GPU-D3D11] texture %u: mode %u format %08X control %08X offset %08X size %ux%u pitch %u valid %u\n",
+            i, (s_gpu.shader_stage_program >> (i * 5)) & 31u, texture->raw_format,
+            texture->control0, texture->offset, texture->width, texture->height, texture->pitch, texture->valid);
+    }
     fflush(stderr);
     _Exit(EXIT_FAILURE);
 #else
@@ -2778,8 +2902,58 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (xbox_Nv2aNativeFencesEnabled() && subch < 8) {
+        static uint32_t classes[8];
+        if (method == 0) {
+            uint32_t instance;
+            if (!ramht_instance(param, &instance)) {
+                fflush(stderr);
+                _Exit(EXIT_FAILURE);
+            }
+            volatile uint32_t *object = xbox_Nv2aRegisterPointer(0x700000 + instance, 4);
+            if (!object) {
+                fflush(stderr);
+                _Exit(EXIT_FAILURE);
+            }
+            classes[subch] = *object & 0xFFFu;
+            return;
+        }
+        if (classes[subch] == 0x44u && method == 0x0310) {
+            volatile uint32_t *color = xbox_Nv2aRegisterPointer(0x400B10, 4);
+            if (!color) {
+                fflush(stderr);
+                _Exit(EXIT_FAILURE);
+            }
+            /* Xbox D3D uses pattern COLOR0 as its consumed-buffer checkpoint. */
+            *color = param;
+            return;
+        }
+    }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(subch, method, param);
+        return;
+    }
+    if (method == 0x0100) {
+        if (!param)
+            return;
+        if (xbox_Nv2aNativeFencesEnabled()) {
+            nv2a_pb_exec_flush();
+            if (xbox_Nv2aSoftwareMethod(param, s_gpu.depth_clear,
+                                       s_gpu.clear_color))
+                return;
+        }
+        note_unhandled(subch, method, param);
+        return;
+    }
+    if (method == 0x01A4 || method == 0x1D6C || method == 0x1D70) {
+        if (method == 0x01A4)
+            s_gpu.semaphore_context = param;
+        else if (method == 0x1D6C)
+            s_gpu.semaphore_offset = param;
+        if (!xbox_Nv2aNativeFencesEnabled())
+            note_unhandled(subch, method, param);
+        else if (method == 0x1D70)
+            semaphore_release(param);
         return;
     }
     if (method == 0x1E60) {

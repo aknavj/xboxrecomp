@@ -95,6 +95,17 @@ static LONG g_dma_banks[XBOX_CONTIG_SIZE / 4096];
 #define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
 static void *g_nv2a_memory = NULL;
 
+volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes)
+{
+    if (!g_nv2a_memory || !bytes || (offset & 3u) ||
+            (uint64_t)offset + bytes > XBOX_NV2A_SIZE) {
+        fprintf(stderr, "[NV2A] unavailable register extent: 0x%08X + %u\n",
+                offset, bytes);
+        return NULL;
+    }
+    return (volatile uint32_t *)((uint8_t *)g_nv2a_memory + offset);
+}
+
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
@@ -877,6 +888,19 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+void xbox_Nv2aAcknowledgeHandshakes(void)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r = xbox_Nv2aRegisterPointer(NV2A_ACK[i].offset, 4);
+        if (!r) {
+            fflush(stderr);
+            _Exit(EXIT_FAILURE);
+        }
+        if (*r & NV2A_ACK[i].busy_mask)
+            *r &= ~NV2A_ACK[i].busy_mask;
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -884,13 +908,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         if (regs[0x008704 / 4] & 1u)
             regs[0x008700 / 4] = 0;
         regs[0x008100 / 4] = 0;
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
-        }
+        xbox_Nv2aAcknowledgeHandshakes();
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
@@ -2965,7 +2983,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
         g_thread_stacks_used--;
 }
 
-/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+/* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
  * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
@@ -2977,43 +2995,148 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * allocates its pushbuffer, which put the buffer at 0x15782000 and left the
  * engine comparing 0x857844C0 against it forever.
  *
- * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
- * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ * XBOX_GPU_INSTANCE_DEFAULT is carved off the top by the GPU-instance bridge.
+ * Streaming assets and level transitions free and reuse the remaining pages. */
+#define CONTIG_PAGE_BYTES 4096u
+#define CONTIG_ARENA_BYTES (XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT)
+#define CONTIG_PAGE_COUNT (CONTIG_ARENA_BYTES / CONTIG_PAGE_BYTES)
+static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+static uint32_t g_contig_owner[CONTIG_PAGE_COUNT];
+static uint32_t g_contig_sizes[CONTIG_PAGE_COUNT];
+static uint32_t g_contig_live_bytes, g_contig_allocs, g_contig_frees;
+static volatile LONG g_contig_high_water;
+
+static uint32_t contig_canonical_va(uint32_t va)
+{
+    if (va >= XBOX_TILED_BASE
+            && (uint64_t)va < (uint64_t)XBOX_TILED_BASE + XBOX_CONTIG_SIZE)
+        return XBOX_CONTIG_BASE + (va - XBOX_TILED_BASE);
+    return va;
+}
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
-    uint32_t result;
+    return xbox_ContiguousAllocEx(size, 0, UINT32_MAX, alignment);
+}
 
+uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
+                               uint32_t alignment)
+{
     if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
-
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
+    if (!g_contig_memory || !size || (alignment & (alignment - 1))
+            || high < low) {
+        fprintf(stderr, "  [CONTIG] invalid allocation: size %u alignment %u "
+                        "physical range 0x%08X..0x%08X, mapped %d\n",
+                size, alignment, low, high, g_contig_memory != NULL);
         fflush(stderr);
         return 0;
     }
+    uint64_t rounded = ((uint64_t)size + CONTIG_PAGE_BYTES - 1)
+                       & ~(uint64_t)(CONTIG_PAGE_BYTES - 1);
+    uint64_t mask = (uint64_t)alignment - 1;
+    uint64_t candidate = ((uint64_t)low + mask) & ~mask;
+    AcquireSRWLockExclusive(&g_contig_lock);
+    while (candidate + rounded <= CONTIG_ARENA_BYTES
+            && candidate + size <= (uint64_t)high + 1) {
+        uint32_t first = (uint32_t)(candidate / CONTIG_PAGE_BYTES);
+        uint32_t pages = (uint32_t)(rounded / CONTIG_PAGE_BYTES);
+        uint32_t i;
+        for (i = first; i < first + pages; i++)
+            if (g_contig_owner[i]) break;
+        if (i != first + pages) {
+            uint32_t head = g_contig_owner[i] - 1;
+            uint64_t next = (uint64_t)head * CONTIG_PAGE_BYTES
+                            + g_contig_sizes[head];
+            candidate = (next + mask) & ~mask;
+            continue;
+        }
+        for (i = first; i < first + pages; i++)
+            g_contig_owner[i] = first + 1;
+        g_contig_sizes[first] = (uint32_t)rounded;
+        g_contig_live_bytes += (uint32_t)rounded;
+        uint32_t previous_high = (uint32_t)g_contig_high_water;
+        if (candidate + rounded > previous_high)
+            InterlockedExchange(&g_contig_high_water, (LONG)(candidate + rounded));
+        uint32_t result = XBOX_CONTIG_BASE + (uint32_t)candidate;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, (size_t)rounded);
+        g_contig_allocs++;
+        if (getenv("RECOMP_CONTIG_TRACE")
+                && (g_contig_allocs <= 32 || g_contig_allocs % 512 == 0)) {
+            fprintf(stderr, "  [CONTIG] alloc #%u size %u -> 0x%08X, "
+                            "live %u, high-water %lu%s\n",
+                    g_contig_allocs, size, result, g_contig_live_bytes,
+                    (unsigned long)g_contig_high_water,
+                    candidate < previous_high ? " (reused)" : "");
+        }
+        ReleaseSRWLockExclusive(&g_contig_lock);
+        return result;
+    }
+    fprintf(stderr, "  [CONTIG] allocation refused: %u bytes alignment %u "
+                    "physical 0x%08X..0x%08X, live %u of %u bytes\n",
+            size, alignment, low, high, g_contig_live_bytes,
+            (unsigned)CONTIG_ARENA_BYTES);
+    ReleaseSRWLockExclusive(&g_contig_lock);
+    fflush(stderr);
+    return 0;
+}
 
-    g_contig_next = result + size;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-    return result;
+uint32_t xbox_ContiguousBlockSize(uint32_t va)
+{
+    va = contig_canonical_va(va);
+    if (va < XBOX_CONTIG_BASE
+            || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + CONTIG_ARENA_BYTES)
+        return 0;
+    uint32_t offset = va - XBOX_CONTIG_BASE, bytes = 0;
+    AcquireSRWLockShared(&g_contig_lock);
+    uint32_t owner = g_contig_owner[offset / CONTIG_PAGE_BYTES];
+    if (owner) {
+        uint32_t head = owner - 1;
+        bytes = g_contig_sizes[head] - (offset - head * CONTIG_PAGE_BYTES);
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return bytes;
+}
+
+void xbox_ContiguousFree(uint32_t va)
+{
+    if (!va) return;
+    va = contig_canonical_va(va);
+    AcquireSRWLockExclusive(&g_contig_lock);
+    if (va < XBOX_CONTIG_BASE
+            || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + CONTIG_ARENA_BYTES
+            || (va & (CONTIG_PAGE_BYTES - 1))) {
+        fprintf(stderr, "  [CONTIG] invalid free address 0x%08X\n", va);
+    } else {
+        uint32_t head = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE_BYTES;
+        uint32_t bytes = g_contig_sizes[head];
+        if (g_contig_owner[head] != head + 1 || !bytes) {
+            fprintf(stderr, "  [CONTIG] unknown or already freed block 0x%08X\n", va);
+        } else {
+            uint32_t pages = bytes / CONTIG_PAGE_BYTES;
+            for (uint32_t i = head; i < head + pages; i++)
+                g_contig_owner[i] = 0;
+            g_contig_sizes[head] = 0;
+            g_contig_live_bytes -= bytes;
+            g_contig_frees++;
+            if (getenv("RECOMP_CONTIG_TRACE")
+                    && (g_contig_frees <= 32 || g_contig_frees % 512 == 0))
+                fprintf(stderr, "  [CONTIG] free #%u 0x%08X size %u, live %u\n",
+                        g_contig_frees, va, bytes, g_contig_live_bytes);
+            ReleaseSRWLockExclusive(&g_contig_lock);
+            return;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_contig_lock);
+    fflush(stderr);
 }
 
 /* How much of the window has been handed out.
  *
- * Lets a caller holding a physical address decide whether it names contiguous
- * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable. */
+ * This is a historical high-water mark, not current usage. Use
+ * xbox_ContiguousBlockSize to identify live allocations. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return (uint32_t)InterlockedCompareExchange(&g_contig_high_water, 0, 0);
 }
 
 /* MmGetPhysicalAddress supplies provenance for ordinary guest RAM buffers.

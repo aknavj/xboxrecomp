@@ -746,8 +746,6 @@ static void bridge_MmAllocateSystemMemory(void)
  * page P is visible at 0x80000000 + P. Titles that pin buffers at fixed
  * physical addresses check the returned pointer against that, so the address
  * has to be honoured rather than satisfied from the general heap. */
-#define XBOX_PHYSICAL_MIRROR_BASE 0x80000000u
-
 static void bridge_MmAllocateContiguousMemoryEx(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -759,36 +757,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 
     (void)prot;
 
-    /*
-     * A caller that constrains the range to exactly one allocation's worth is
-     * demanding a specific physical address, not expressing a preference.
-     * Halo does this for its two big pools and asserts on the result
-     * (physical_memory_map.c:46) - XPhysicalAlloc passes lowest = the address
-     * it wants and highest = lowest + size - 1, then requires
-     * 0x80000000 | lowest back. Satisfying that from the heap fails the assert
-     * and leaves its whole memory map wrong.
-     */
-    if (low && high >= low && (high - low + 1) <= size + 0x1000) {
-        xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
-
-        /* The console hands out zeroed pages here, and titles rely on it:
-         * pool headers and free-list roots are assumed clear, so whatever the
-         * backing view happened to contain shows up later as structures that
-         * are "allocated" but full of garbage. */
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
-
-        if (KERNEL_LOG_ON_HALF()) {
-            fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
-                    "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
-                    size, low, xbox_va);
-            fflush(stderr);
-        }
-        g_eax = xbox_va;
-        return;
-    }
-
-    if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+        xbox_va = xbox_ContiguousAllocEx(size, low, high, align);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -805,7 +774,10 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    if (addr & 0x80000000u)
+        xbox_ContiguousFree(addr);
+    else
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -1948,19 +1920,6 @@ static void bridge_KeSynchronizeExecution(void)
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
-/* -- KeRemoveQueueDpc (ordinal 137) ------------------------
- * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
- *
- * Cancels a queued DPC, returning whether it was still in the queue. DPCs run
- * inline here (see KeInsertQueueDpc), so by the time anyone can call this the
- * routine has already run and there is nothing to cancel. FALSE is both the
- * honest answer and the one that keeps a caller's bookkeeping right.
- */
-static void bridge_KeRemoveQueueDpc(void)
-{
-    g_eax = 0;
-}
-
 /* The pending DPC queue.
  *
  * These used to run inline, on whichever thread queued them, before the caller
@@ -1982,6 +1941,7 @@ static void bridge_KeRemoveQueueDpc(void)
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+static SRWLOCK g_dpc_lock = SRWLOCK_INIT;
 
 static void bridge_KeInsertQueueDpc(void)
 {
@@ -1990,13 +1950,26 @@ static void bridge_KeInsertQueueDpc(void)
     uint32_t arg2 = STACK_ARG(2);
     LONG tail, next;
 
-    if (!dpc) { g_eax = 0; return; }
+    if (!bridge_buf_ok(dpc, 32, "KeInsertQueueDpc")) {
+        g_eax = 0;
+        return;
+    }
 
+    AcquireSRWLockExclusive(&g_dpc_lock);
+    for (LONG i = g_dpc_head; i != g_dpc_tail;
+            i = (i + 1) % XBOX_MAX_PENDING_DPC) {
+        if (g_dpc_queue[i].dpc == dpc) {
+            ReleaseSRWLockExclusive(&g_dpc_lock);
+            g_eax = 0;
+            return;
+        }
+    }
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
+        ReleaseSRWLockExclusive(&g_dpc_lock);
         g_eax = 0;
         return;
     }
@@ -2004,7 +1977,30 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
+    ReleaseSRWLockExclusive(&g_dpc_lock);
     g_eax = 1;
+}
+
+static void bridge_KeRemoveQueueDpc(void)
+{
+    uint32_t dpc = STACK_ARG(0);
+    g_eax = 0;
+    AcquireSRWLockExclusive(&g_dpc_lock);
+    for (LONG i = g_dpc_head; i != g_dpc_tail;
+            i = (i + 1) % XBOX_MAX_PENDING_DPC) {
+        if (g_dpc_queue[i].dpc != dpc)
+            continue;
+        LONG next = (i + 1) % XBOX_MAX_PENDING_DPC;
+        while (next != g_dpc_tail) {
+            g_dpc_queue[i] = g_dpc_queue[next];
+            i = next;
+            next = (next + 1) % XBOX_MAX_PENDING_DPC;
+        }
+        g_dpc_tail = i;
+        g_eax = 1;
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_dpc_lock);
 }
 
 /* Call a connected interrupt service routine.
@@ -2124,10 +2120,16 @@ static void kernel_apu_tick(void)
 
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+    for (;;) {
+        PendingDpc d;
+        AcquireSRWLockExclusive(&g_dpc_lock);
+        if (g_dpc_head == g_dpc_tail) {
+            ReleaseSRWLockExclusive(&g_dpc_lock);
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        ReleaseSRWLockExclusive(&g_dpc_lock);
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
@@ -2369,6 +2371,73 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 static INIT_ONCE g_timer_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_timer_failed;
+static struct {
+    recomp_func_t routine;
+    uint32_t context, parameter, depth_clear, color_clear;
+    HANDLE completed;
+    volatile LONG pending;
+} g_nv2a_software;
+
+int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context)
+{
+    recomp_func_t fn = recomp_lookup(routine);
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn || g_nv2a_software.routine
+            || !bridge_buf_ok(context, 4, "NV2A software-method context")) {
+        fprintf(stderr, "  [NV2A] Cannot register software-method handler "
+                        "0x%08X context 0x%08X\n", routine, context);
+        fflush(stderr);
+        return -1;
+    }
+    g_nv2a_software.completed = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_nv2a_software.completed) {
+        fprintf(stderr, "  [NV2A] Cannot create software-method completion "
+                        "event: error %lu\n", GetLastError());
+        fflush(stderr);
+        return -1;
+    }
+    g_nv2a_software.context = context;
+    g_nv2a_software.routine = fn;
+    return 0;
+}
+
+static void kernel_nv2a_software_tick(void)
+{
+    uint32_t stack;
+    KIRQL old_irql;
+    if (!InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0))
+        return;
+    volatile uint32_t *depth = xbox_Nv2aRegisterPointer(0x401A88, 4);
+    volatile uint32_t *color = xbox_Nv2aRegisterPointer(0x40186C, 4);
+    if (!depth || !color) {
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    *depth = g_nv2a_software.depth_clear;
+    *color = g_nv2a_software.color_clear;
+    stack = g_esp;
+    g_ecx = g_nv2a_software.context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_nv2a_software.parameter;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    old_irql = bridge_raise_irql(DISPATCH_LEVEL);
+    g_nv2a_software.routine();
+    bridge_lower_irql(old_irql);
+    if (g_esp != stack) {
+        fprintf(stderr, "  [NV2A] Software method 0x%08X corrupted callback "
+                        "stack: 0x%08X -> 0x%08X\n",
+                g_nv2a_software.parameter, stack, g_esp);
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    InterlockedExchange(&g_nv2a_software.pending, 0);
+    if (!SetEvent(g_nv2a_software.completed)) {
+        fprintf(stderr, "  [NV2A] Software-method completion failed: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+}
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2379,6 +2448,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
         fflush(stderr);
+        InterlockedExchange(&g_timer_failed, 1);
         return 0;
     }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
@@ -2392,6 +2462,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
                             "timer DPCs will not run\n");
             fflush(stderr);
+            InterlockedExchange(&g_timer_failed, 1);
             return 0;
         }
         g_fs_base = tib;
@@ -2402,6 +2473,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(xbox_GetConnectedInterrupt(5u) ? 1 : 10);
+        kernel_nv2a_software_tick();
         kernel_apu_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2459,6 +2531,44 @@ static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once, PVOID parameter, PVOID *
 static int kernel_start_timer(void)
 {
     return InitOnceExecuteOnce(&g_timer_once, kernel_timer_init, NULL, NULL) != FALSE;
+}
+
+int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
+                            uint32_t color_clear)
+{
+    static unsigned trace_count;
+    if (!g_nv2a_software.routine)
+        return 0;
+    if (!kernel_start_timer()
+            || InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0)) {
+        fprintf(stderr, "  [NV2A] Software-method worker unavailable or busy\n");
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    if (getenv("RECOMP_PB_FAILURE_TRACE") && trace_count++ < 64)
+        fprintf(stderr, "  [NV2A] software method 0x%08X, depth-clear "
+                        "0x%08X, color-clear 0x%08X\n",
+                parameter, depth_clear, color_clear);
+    g_nv2a_software.parameter = parameter;
+    g_nv2a_software.depth_clear = depth_clear;
+    g_nv2a_software.color_clear = color_clear;
+    InterlockedExchange(&g_nv2a_software.pending, 1);
+    for (;;) {
+        DWORD result = WaitForSingleObject(g_nv2a_software.completed, 1);
+        if (result == WAIT_OBJECT_0)
+            return 1;
+        if (result != WAIT_TIMEOUT
+                || InterlockedCompareExchange(&g_timer_failed, 0, 0)) {
+            fprintf(stderr, "  [NV2A] Software method 0x%08X failed: "
+                            "wait %lu, error %lu\n",
+                    parameter, result, GetLastError());
+            fflush(stderr);
+            _Exit(EXIT_FAILURE);
+        }
+        /* PFB flushes and a preceding vblank ISR must still finish while
+         * FIFO execution waits for the shared DPC worker. */
+        xbox_Nv2aAcknowledgeHandshakes();
+    }
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
@@ -4034,7 +4144,10 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t addr = STACK_ARG(0);
+    g_eax = xbox_ContiguousBlockSize(addr);
+    if (!g_eax)
+        g_eax = xbox_HeapBlockSize(addr);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */

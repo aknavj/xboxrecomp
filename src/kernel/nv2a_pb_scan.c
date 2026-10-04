@@ -26,10 +26,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define PB_MAX_METHODS 4096
+#define PB_HISTORY_SIZE 32
+
+static struct {
+    uint32_t va, word, remaining, method;
+} s_history[PB_HISTORY_SIZE];
+static uint32_t s_history_next, s_history_count;
+static int s_failure_trace = -1;
+static struct {
+    uint32_t va, word, target;
+} s_control_history[16];
+static uint32_t s_control_next, s_control_count;
+
+static void note_control(uint32_t va, uint32_t word, uint32_t target)
+{
+    if (!s_failure_trace)
+        return;
+    s_control_history[s_control_next].va = va;
+    s_control_history[s_control_next].word = word;
+    s_control_history[s_control_next].target = target;
+    s_control_next = (s_control_next + 1) % 16;
+    if (s_control_count < 16)
+        s_control_count++;
+}
 
 static struct { uint32_t method, subch, count; } s_seen[PB_MAX_METHODS];
 static int s_seen_count;
@@ -156,6 +180,48 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
+static void failure_context(uint32_t start_va, uint32_t end_va, uint32_t va,
+                            uint32_t words, uint32_t remaining,
+                            uint32_t method, uint32_t return_va)
+{
+    fprintf(stderr, "[PB] segment 0x%08X -> 0x%08X, current 0x%08X, words %u, remaining %u, method 0x%04X, return 0x%08X\n",
+            start_va, end_va, va, words, remaining, method, return_va);
+    if (s_failure_trace) {
+        volatile uint32_t *dma = xbox_Nv2aRegisterPointer(0x800040, 8);
+        if (dma)
+            fprintf(stderr, "[PB] live DMA PUT 0x%08X GET 0x%08X\n", dma[0], dma[1]);
+        uint32_t first = (s_history_next + PB_HISTORY_SIZE - s_history_count) % PB_HISTORY_SIZE;
+        for (uint32_t i = 0; i < s_history_count; i++) {
+            uint32_t index = (first + i) % PB_HISTORY_SIZE;
+            fprintf(stderr, "[PB] recent 0x%08X: 0x%08X, remaining %u, method 0x%04X\n",
+                    s_history[index].va, s_history[index].word,
+                    s_history[index].remaining, s_history[index].method);
+        }
+        first = (s_control_next + 16 - s_control_count) % 16;
+        for (uint32_t i = 0; i < s_control_count; i++) {
+            uint32_t index = (first + i) % 16;
+            fprintf(stderr, "[PB] control 0x%08X: 0x%08X -> 0x%08X\n",
+                    s_control_history[index].va, s_control_history[index].word,
+                    s_control_history[index].target);
+            uint32_t source = s_control_history[index].va;
+            uint32_t target = s_control_history[index].target;
+            if (source >= XBOX_CONTIG_BASE + 256 &&
+                    source < XBOX_CONTIG_BASE + 0x200000 &&
+                    target >= XBOX_CONTIG_BASE + 0x200000) {
+                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                fprintf(stderr, "[PB] invoke prefix for 0x%08X\n", source);
+                for (uint32_t at = source - 256; at <= source; at += 32) {
+                    const uint32_t *p = (const uint32_t *)(mem + at);
+                    fprintf(stderr, "[PB] prefix 0x%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                            at, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                }
+            }
+        }
+        nv2a_pb_scan_report();
+        nv2a_pb_exec_report();
+    }
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     static uint32_t pending_count, pending_method, pending_subch, pending_next;
@@ -165,29 +231,54 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     uint32_t address_base = start_va >= XBOX_CONTIG_BASE ? XBOX_CONTIG_BASE : 0;
     uint32_t va = start_va;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    volatile uint32_t *dma_get = NULL;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = 1;
+    if (s_failure_trace < 0)
+        s_failure_trace = getenv("RECOMP_PB_FAILURE_TRACE") != NULL;
     if (end_va == start_va)
         return;
+    if (s_exec_enabled) {
+        dma_get = xbox_Nv2aRegisterPointer(0x800044, 4);
+        if (!dma_get) {
+            fflush(stderr); _Exit(EXIT_FAILURE);
+        }
+    }
     if (pending_count && start_va != pending_next) {
         fprintf(stderr, "[PB] discontinuous method packet: expected 0x%08X, received 0x%08X, %u parameters remain\n",
                 pending_next, start_va, pending_count);
+        failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
         fflush(stderr);
         _Exit(EXIT_FAILURE);
     }
     while (va != end_va && words < 0x100000u) {
         if ((va & 3u) || va < address_base || (uint64_t)va + 4 > (uint64_t)address_base + XBOX_CONTIG_SIZE) {
             fprintf(stderr, "[PB] invalid command address 0x%08X\n", va);
+            failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
             fflush(stderr); _Exit(EXIT_FAILURE);
         }
         uint32_t w = *(const uint32_t *)(mem + va);
+        if (s_failure_trace) {
+            s_history[s_history_next].va = va;
+            s_history[s_history_next].word = w;
+            s_history[s_history_next].remaining = pending_count;
+            s_history[s_history_next].method = pending_count ? pending_method : 0;
+            s_history_next = (s_history_next + 1) % PB_HISTORY_SIZE;
+            if (s_history_count < PB_HISTORY_SIZE)
+                s_history_count++;
+        }
         va += 4;
         words++;
 
         if (pending_count) {
             note(pending_subch, pending_method);
-            if (s_exec_enabled) nv2a_pb_exec_method(pending_subch, pending_method, w);
+            if (s_exec_enabled) {
+                /* Publish the fetched parameter before its semaphore or
+                 * callback can wake a CPU rewriting later command words. */
+                *dma_get = va & 0x0FFFFFFFu;
+                nv2a_pb_exec_method(pending_subch, pending_method, w);
+            }
             if (!pending_noninc) pending_method += 4;
             pending_count--;
             pending_next = va;
@@ -195,25 +286,35 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         }
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             jumps++;
-            va = address_base | ((w & 3u) == 1u ? w & 0xFFFFFFFCu : w & 0x1FFFFFFCu);
+            uint32_t target = address_base | ((w & 3u) == 1u ? w & 0xFFFFFFFCu : w & 0x1FFFFFFCu);
+            note_control(va - 4, w, target);
+            va = target;
+            if (dma_get) *dma_get = va & 0x0FFFFFFFu;
             continue;
         }
         if ((w & 3u) == 2u) {
             if (return_va) {
                 fprintf(stderr, "[PB] nested DMA subroutine at 0x%08X\n", va - 4);
+                failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
                 fflush(stderr); _Exit(EXIT_FAILURE);
             }
             return_va = va;
-            va = address_base | (w & 0xFFFFFFFCu);
+            uint32_t target = address_base | (w & 0xFFFFFFFCu);
+            note_control(va - 4, w, target);
+            va = target;
+            if (dma_get) *dma_get = va & 0x0FFFFFFFu;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {
             if (!return_va) {
                 fprintf(stderr, "[PB] DMA return without call at 0x%08X\n", va - 4);
+                failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
                 fflush(stderr); _Exit(EXIT_FAILURE);
             }
+            note_control(va - 4, w, return_va);
             va = return_va;
             return_va = 0;
+            if (dma_get) *dma_get = va & 0x0FFFFFFFu;
             continue;
         }
         if ((w & 0x00030003u) == 0u) {
@@ -222,13 +323,17 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             pending_method = w & 0x1FFCu;
             pending_noninc = (w & 0xE0000000u) == 0x40000000u;
             pending_next = va;
+            if (dma_get) *dma_get = va & 0x0FFFFFFFu;
             continue;
         }
         unknown++;
+        if (dma_get) *dma_get = va & 0x0FFFFFFFu;
     }
 
     if (va != end_va) {
-        fprintf(stderr, "[PB] command walk failed to reach PUT 0x%08X from 0x%08X\n", end_va, start_va);
+        fprintf(stderr, "[PB] command walk failed to reach PUT 0x%08X from 0x%08X (%u jumps, %u unknown words)\n",
+                end_va, start_va, jumps, unknown);
+        failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
         fflush(stderr); _Exit(EXIT_FAILURE);
     }
     s_tot_words += words;
