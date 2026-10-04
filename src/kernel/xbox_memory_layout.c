@@ -991,12 +991,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (s_nv2a_trace && now_ms - last_report > 10000) {
+                    if (now_ms - last_report > 10000) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
+                /* Commands have been fetched/submitted; native fences signal completion. */
                 {
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
@@ -1019,8 +1019,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         fence_mirrors_tick();
@@ -2356,9 +2356,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
-        /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
-        s_nv2a_trace = 1;
+        {
+            const char *trace = getenv("RECOMP_NV2A_TRACE");
+            s_nv2a_trace = trace && *trace && strcmp(trace, "0") != 0;
+        }
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",

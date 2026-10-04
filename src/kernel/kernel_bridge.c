@@ -368,8 +368,45 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Log counter - limit output to avoid flooding */
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
-static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static int g_kernel_call_count = 0;
+static DECLSPEC_ALIGN(8) volatile LONG64 g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static DECLSPEC_ALIGN(8) volatile LONG64 g_kernel_call_count;
+static RECOMP_TLS unsigned long long g_kernel_call_index;
+
+static INIT_ONCE g_audio_guard_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_audio_guard;
+static RECOMP_TLS uint32_t g_callback_vector;
+
+static BOOL CALLBACK kernel_audio_guard_init(PINIT_ONCE once, PVOID parameter,
+                                             PVOID *context)
+{
+    (void)once; (void)parameter; (void)context;
+    if (!InitializeCriticalSectionEx(&g_audio_guard, 0, 0)) {
+        fprintf(stderr, "  [AUDIO] Cannot initialize guest audio guard: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void xbox_GuestAudioGuardEnter(void)
+{
+    if (!InitOnceExecuteOnce(&g_audio_guard_once, kernel_audio_guard_init, NULL, NULL))
+        _Exit(EXIT_FAILURE);
+    EnterCriticalSection(&g_audio_guard);
+}
+
+int xbox_GuestAudioGuardTryEnter(void)
+{
+    if (!InitOnceExecuteOnce(&g_audio_guard_once, kernel_audio_guard_init, NULL, NULL))
+        _Exit(EXIT_FAILURE);
+    return TryEnterCriticalSection(&g_audio_guard) != FALSE;
+}
+
+void xbox_GuestAudioGuardLeave(void)
+{
+    LeaveCriticalSection(&g_audio_guard);
+}
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -381,7 +418,7 @@ static int g_kernel_call_count = 0;
  */
 static long kernel_log_budget(void)
 {
-    static long budget = -1;
+    static RECOMP_TLS long budget = -1;
 
     if (budget < 0) {
         const char *env = getenv("RECOMP_KERNEL_LOG_BUDGET");
@@ -392,9 +429,9 @@ static long kernel_log_budget(void)
     return budget;
 }
 
-#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
+#define KERNEL_LOG_ON()      (g_kernel_call_index != 0 && g_kernel_call_index <= (unsigned long long)kernel_log_budget())
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
-#define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
+#define KERNEL_LOG_ON_HALF() (g_kernel_call_index != 0 && g_kernel_call_index <= (unsigned long long)(kernel_log_budget() / 2))
 
 /* Read Xbox stack arg as uint32_t.
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
@@ -1827,9 +1864,10 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
-static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
+                          uint32_t vector)
 {
-    uint32_t routine, context;
+    uint32_t routine, context, previous_vector;
     KIRQL old_irql;
     recomp_func_t fn;
     static int trace = -1;
@@ -1864,7 +1902,10 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     old_irql = bridge_raise_irql(DISPATCH_LEVEL);
+    previous_vector = g_callback_vector;
+    g_callback_vector = vector;
     fn();
+    g_callback_vector = previous_vector;
     bridge_lower_irql(old_irql);
     return 1;
 }
@@ -1938,7 +1979,7 @@ static void bridge_KeSynchronizeExecution(void)
  * DPC ordering beyond "after the ISR".
  */
 #define XBOX_MAX_PENDING_DPC 64
-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
+typedef struct { uint32_t dpc, arg1, arg2, vector; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 static SRWLOCK g_dpc_lock = SRWLOCK_INIT;
@@ -1976,6 +2017,7 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_queue[tail].vector = g_callback_vector;
     g_dpc_tail = next;
     ReleaseSRWLockExclusive(&g_dpc_lock);
     g_eax = 1;
@@ -2018,7 +2060,7 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
 static int kernel_raise_interrupt(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
-    uint32_t routine, context;
+    uint32_t routine, context, previous_vector;
     recomp_func_t fn;
     KIRQL old_irql;
 
@@ -2033,12 +2075,20 @@ static int kernel_raise_interrupt(uint32_t vector)
     if (!fn)
         return -1;
 
+    if (vector == 5u && !xbox_GuestAudioGuardTryEnter())
+        return -2;
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     old_irql = bridge_raise_irql((KIRQL)BRIDGE_MEM32(kint + 12));
+    previous_vector = g_callback_vector;
+    g_callback_vector = vector;
     fn();
+    g_callback_vector = previous_vector;
     bridge_lower_irql(old_irql);
+    if (vector == 5u)
+        xbox_GuestAudioGuardLeave();
     return (int)(g_eax & 1u);
 }
 
@@ -2110,6 +2160,8 @@ static void kernel_apu_tick(void)
         return;
     {
         int claimed = kernel_raise_interrupt(5u);
+        if (claimed == -2)
+            return;
         if (reports++ < 3) {
             fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
                     claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
@@ -2128,9 +2180,17 @@ static void kernel_drain_dpcs(void)
             break;
         }
         d = g_dpc_queue[g_dpc_head];
+        /* Leave audio work queued rather than blocking the shared GPU worker
+         * on a guest thread's DirectSound critical region. */
+        if (d.vector == 5u && !xbox_GuestAudioGuardTryEnter()) {
+            ReleaseSRWLockExclusive(&g_dpc_lock);
+            break;
+        }
         g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
         ReleaseSRWLockExclusive(&g_dpc_lock);
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        kernel_run_dpc(d.dpc, d.arg1, d.arg2, d.vector);
+        if (d.vector == 5u)
+            xbox_GuestAudioGuardLeave();
     }
 }
 
@@ -2372,21 +2432,30 @@ static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 static INIT_ONCE g_timer_once = INIT_ONCE_STATIC_INIT;
 static volatile LONG g_timer_failed;
+static HANDLE g_timer_wake;
 static struct {
     recomp_func_t routine;
     uint32_t context, parameter, depth_clear, color_clear;
     HANDLE completed;
     volatile LONG pending;
+    long long frequency, elapsed_ticks;
+    uint64_t requests;
 } g_nv2a_software;
 
 int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context)
 {
+    LARGE_INTEGER frequency;
     recomp_func_t fn = recomp_lookup(routine);
     if (!fn) fn = recomp_lookup_manual(routine);
     if (!fn || g_nv2a_software.routine
             || !bridge_buf_ok(context, 4, "NV2A software-method context")) {
         fprintf(stderr, "  [NV2A] Cannot register software-method handler "
                         "0x%08X context 0x%08X\n", routine, context);
+        fflush(stderr);
+        return -1;
+    }
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
+        fprintf(stderr, "  [NV2A] Cannot query software-method timing frequency\n");
         fflush(stderr);
         return -1;
     }
@@ -2398,6 +2467,7 @@ int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context)
         return -1;
     }
     g_nv2a_software.context = context;
+    g_nv2a_software.frequency = frequency.QuadPart;
     g_nv2a_software.routine = fn;
     return 0;
 }
@@ -2439,11 +2509,21 @@ static void kernel_nv2a_software_tick(void)
     }
 }
 
+static long long kernel_counter(void);
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
+    LARGE_INTEGER frequency;
+    long long next_tick;
 
     (void)unused;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
+        fprintf(stderr, "  [KERNEL] Cannot query timer timing frequency\n");
+        fflush(stderr);
+        InterlockedExchange(&g_timer_failed, 1);
+        return 0;
+    }
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -2468,12 +2548,25 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    next_tick = kernel_counter() + frequency.QuadPart * (xbox_GetConnectedInterrupt(5u) ? 1 : 10) / 1000;
     for (;;) {
         long long now;
         int i;
-
-        Sleep(xbox_GetConnectedInterrupt(5u) ? 1 : 10);
+        DWORD interval = xbox_GetConnectedInterrupt(5u) ? 1 : 10;
+        long long remaining = next_tick - kernel_counter();
+        DWORD wait_ms = remaining <= 0 ? 0 :
+            remaining < frequency.QuadPart * interval / 1000 ?
+                (DWORD)((remaining * 1000 + frequency.QuadPart - 1) / frequency.QuadPart) : interval;
+        DWORD result = WaitForSingleObject(g_timer_wake, wait_ms);
+        if (result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT) {
+            fprintf(stderr, "  [KERNEL] timer wake failed: wait %lu, error %lu\n", result, GetLastError());
+            fflush(stderr);
+            InterlockedExchange(&g_timer_failed, 1);
+            return 0;
+        }
         kernel_nv2a_software_tick();
+        if (kernel_counter() < next_tick)
+            continue;
         kernel_apu_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2497,7 +2590,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
+                kernel_run_dpc(dpc, 0, 0, 0);
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -2509,6 +2602,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        next_tick = kernel_counter() + frequency.QuadPart * (xbox_GetConnectedInterrupt(5u) ? 1 : 10) / 1000;
     }
 }
 
@@ -2517,9 +2611,19 @@ static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once, PVOID parameter, PVOID *
     HANDLE thread;
     (void)once; (void)parameter; (void)context;
     InitializeCriticalSection(&g_timer_lock);
+    g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_timer_wake) {
+        fprintf(stderr, "  [KERNEL] Cannot create timer wake event: error %lu\n", GetLastError());
+        fflush(stderr);
+        DeleteCriticalSection(&g_timer_lock);
+        return FALSE;
+    }
     thread = CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL);
     if (!thread) {
-        fprintf(stderr, "  [KERNEL] Cannot start timer/interrupt thread: error %lu\n", GetLastError());
+        DWORD error = GetLastError();
+        CloseHandle(g_timer_wake);
+        g_timer_wake = NULL;
+        fprintf(stderr, "  [KERNEL] Cannot start timer/interrupt thread: error %lu\n", error);
         DeleteCriticalSection(&g_timer_lock);
         return FALSE;
     }
@@ -2533,10 +2637,32 @@ static int kernel_start_timer(void)
     return InitOnceExecuteOnce(&g_timer_once, kernel_timer_init, NULL, NULL) != FALSE;
 }
 
+static long long kernel_counter(void)
+{
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        fprintf(stderr, "  [KERNEL] Cannot query performance timing counter\n");
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    return counter.QuadPart;
+}
+
+void xbox_Nv2aSoftwareMethodReport(void)
+{
+    if (!g_nv2a_software.frequency) return;
+    double seconds = (double)g_nv2a_software.elapsed_ticks / g_nv2a_software.frequency;
+    fprintf(stderr, "[NV2A] software dispatch: %llu requests, %.3fs wait, %.3fms average\n",
+            (unsigned long long)g_nv2a_software.requests, seconds,
+            g_nv2a_software.requests ? seconds * 1000 / g_nv2a_software.requests : 0);
+}
+
 int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
                             uint32_t color_clear)
 {
     static unsigned trace_count;
+    long long started, spin_ticks;
+    DWORD wait_ms = 0;
     if (!g_nv2a_software.routine)
         return 0;
     if (!kernel_start_timer()
@@ -2552,11 +2678,21 @@ int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
     g_nv2a_software.parameter = parameter;
     g_nv2a_software.depth_clear = depth_clear;
     g_nv2a_software.color_clear = color_clear;
+    started = kernel_counter();
+    spin_ticks = g_nv2a_software.frequency / 4000;
     InterlockedExchange(&g_nv2a_software.pending, 1);
+    if (!SetEvent(g_timer_wake)) {
+        fprintf(stderr, "  [NV2A] Cannot wake software-method worker: error %lu\n", GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
     for (;;) {
-        DWORD result = WaitForSingleObject(g_nv2a_software.completed, 1);
-        if (result == WAIT_OBJECT_0)
+        DWORD result = WaitForSingleObject(g_nv2a_software.completed, wait_ms);
+        if (result == WAIT_OBJECT_0) {
+            g_nv2a_software.elapsed_ticks += kernel_counter() - started;
+            g_nv2a_software.requests++;
             return 1;
+        }
         if (result != WAIT_TIMEOUT
                 || InterlockedCompareExchange(&g_timer_failed, 0, 0)) {
             fprintf(stderr, "  [NV2A] Software method 0x%08X failed: "
@@ -2565,6 +2701,10 @@ int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
             fflush(stderr);
             _Exit(EXIT_FAILURE);
         }
+        if (kernel_counter() - started >= spin_ticks)
+            wait_ms = 1;
+        else
+            YieldProcessor();
         /* PFB flushes and a preceding vblank ISR must still finish while
          * FIFO execution waits for the shared DPC worker. */
         xbox_Nv2aAcknowledgeHandshakes();
@@ -9207,9 +9347,11 @@ static void kernel_thunk_dispatch(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
-    g_kernel_call_count++;
+    unsigned long long call_index =
+        (unsigned long long)InterlockedIncrement64(&g_kernel_call_count);
+    g_kernel_call_index = call_index;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
-        g_ordinal_calls[ordinal]++;
+        InterlockedIncrement64(&g_ordinal_calls[ordinal]);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -9217,19 +9359,23 @@ static void kernel_thunk_dispatch(void)
          * function is calling this" into "this call site is", which is the
          * difference between guessing and knowing when a title recurses. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
-                g_kernel_call_count, ordinal, slot, g_esp,
+                "  [KERNEL] #%llu: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                call_index, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
     }
 
     {
-        static DWORD last_summary_tick = 0;
+        static volatile LONG last_summary_tick;
         DWORD now = GetTickCount();
-        if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-                fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X ret=0x%08X lock=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp,
+        DWORD previous = (DWORD)InterlockedCompareExchange(&last_summary_tick, 0, 0);
+        if (previous == 0)
+            InterlockedCompareExchange(&last_summary_tick, (LONG)now, 0);
+        if (previous != 0 && now - previous >= 2000 && call_index > 200
+                && (DWORD)InterlockedCompareExchange(&last_summary_tick,
+                    (LONG)now, (LONG)previous) == previous) {
+                fprintf(stderr, "  [KERNEL] summary: %llu total calls, latest ordinal %u (slot %d) esp=0x%08X ret=0x%08X lock=0x%08X\n",
+                    call_index, ordinal, slot, g_esp,
                     g_esp ? BRIDGE_MEM32(g_esp) : 0,
                     (ordinal == 277 || ordinal == 294) && g_esp
                     ? BRIDGE_MEM32(g_esp + 4) : 0);
@@ -9246,25 +9392,28 @@ static void kernel_thunk_dispatch(void)
              * title sitting still is actually asking the kernel for, and
              * that wants counting rather than sampling. */
             {
-                static unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
+                unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
+                unsigned long long ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
                 int r, shown;
 
                 memset(shown_ord, 0, sizeof shown_ord);
+                for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
+                    ordinal_calls[r] = (unsigned long long)
+                        InterlockedCompareExchange64(&g_ordinal_calls[r], 0, 0);
                 for (shown = 0; shown < 6; shown++) {
                     int best = -1;
                     for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
-                        if (g_ordinal_calls[r] && !shown_ord[r]
-                            && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
+                        if (ordinal_calls[r] && !shown_ord[r]
+                            && (best < 0 || ordinal_calls[r] > ordinal_calls[best]))
                             best = r;
                     if (best < 0)
                         break;
                     shown_ord[best] = 1;
                     fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
-                            (unsigned long long)g_ordinal_calls[best]);
+                            ordinal_calls[best]);
                 }
             }
             fflush(stderr);
-            last_summary_tick = now;
         }
     }
 
@@ -9300,9 +9449,9 @@ static void kernel_thunk_dispatch(void)
             if (_watch_before != seen) {
                 seen = _watch_before;
                 fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
-                                " (call #%d)\n",
+                                " (call #%llu)\n",
                         g_kernel_watch_va, _watch_before, ordinal,
-                        g_kernel_call_count);
+                        call_index);
                 fflush(stderr);
             }
         }

@@ -1124,9 +1124,14 @@ static void voice_process(MCPXAPUState *d,
         for (int channel = 0; channel < 2; channel++)
             dbg->source_peak = fmaxf(dbg->source_peak, fabsf(samples[i][channel]));
     bool diagnostic = mcpx_apu_diagnostics_enabled();
-    if (diagnostic)
+    if (diagnostic) {
         dbg->source_peak_since_report =
             fmaxf(dbg->source_peak_since_report, dbg->source_peak);
+        if (dbg->min_rate_since_report == 0.0f ||
+            rate < dbg->min_rate_since_report)
+            dbg->min_rate_since_report = rate;
+        dbg->max_rate_since_report = fmaxf(dbg->max_rate_since_report, rate);
+    }
 
     int bin[8];
     bin[0] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V0BIN);
@@ -1169,6 +1174,12 @@ static void voice_process(MCPXAPUState *d,
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
+    if (diagnostic) {
+        dbg->filter_mode = (uint32_t)fmode;
+        for (int ch = 0; ch < 2; ch++)
+            dbg->filter_coeff[ch] = voice_get_mask(
+                d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4, UINT32_MAX);
+    }
     bool lpf = false;
     if (v < MCPX_HW_MAX_3D_VOICES) {
         lpf = (fmode == 1);
@@ -1189,6 +1200,10 @@ static void voice_process(MCPXAPUState *d,
             setup_svf(filter, fc_f, q_f, F_LP);
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 samples[i][ch] = run_svf(filter, samples[i][ch]);
+                if (diagnostic && fabsf(samples[i][ch]) > 1.0f)
+                    dbg->filter_clipped_since_report++;
+                if (diagnostic && !isfinite(samples[i][ch]))
+                    dbg->filter_nonfinite_since_report++;
                 samples[i][ch] = fminf(fmaxf(samples[i][ch], -1.0f), 1.0f);
             }
         }
@@ -1211,6 +1226,9 @@ static void voice_process(MCPXAPUState *d,
             for (int channel = 0; channel < 2; channel++)
                 filtered_peak[channel] =
                     fmaxf(filtered_peak[channel], fabsf(samples[i][channel]));
+        dbg->filtered_peak_since_report = fmaxf(
+            dbg->filtered_peak_since_report,
+            fmaxf(filtered_peak[0], filtered_peak[1]));
     }
     for (int b = 0; b < 8; b++) {
         float g = ea_value;

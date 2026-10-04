@@ -42,6 +42,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -65,6 +66,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
+    InterlockedIncrement64(&s_present_frame);
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
@@ -246,6 +248,24 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+static int fb_format_window_title(char *caption, size_t capacity, const char *game_title,
+                                  double fps, LONG64 frame)
+{
+    int length = snprintf(caption, capacity, "%s | %.2f FPS | Frame %llu",
+                          game_title, fps, (unsigned long long)frame);
+    if (length < 0 || (size_t)length >= capacity) {
+        fprintf(stderr, "[FBWIN] failed to format window-title statistics\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void fb_set_window_title(HWND hwnd, const char *caption)
+{
+    if (!SetWindowTextA(hwnd, caption))
+        fprintf(stderr, "[FBWIN] failed to update window title: error %lu\n", GetLastError());
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -253,8 +273,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     BITMAPINFO bi;
     RECT r;
     const char *window_title = getenv("RECOMP_WINDOW_TITLE");
+    const char *game_title = window_title && window_title[0] ? window_title : "Xbox Recomp - Framebuffer";
+    size_t caption_capacity = strlen(game_title) + 96;
+    char *caption = (char *)malloc(caption_capacity);
+    LARGE_INTEGER title_frequency, title_clock;
+    LONG64 title_frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+    int title_stats = caption != NULL;
 
     (void)unused;
+    if (!caption)
+        fprintf(stderr, "[FBWIN] cannot allocate window-title statistics buffer\n");
+    else if (!QueryPerformanceFrequency(&title_frequency) || title_frequency.QuadPart <= 0 ||
+             !QueryPerformanceCounter(&title_clock)) {
+        fprintf(stderr, "[FBWIN] window-title statistics unavailable: cannot query performance clock\n");
+        title_stats = 0;
+    } else if (!fb_format_window_title(caption, caption_capacity, game_title, 0.0, title_frame))
+        title_stats = 0;
 
     {
         WNDCLASSA wc;
@@ -268,13 +302,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
-                           window_title && window_title[0] ? window_title : "Xbox Recomp - Framebuffer",
+                           title_stats ? caption : game_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (!hwnd) {
         InterlockedExchange(&s_fb_running, 0);
+        free(caption);
         return 0;
     }
     hdc = GetDC(hwnd);
@@ -297,6 +332,26 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+        if (title_stats) {
+            LARGE_INTEGER now;
+            if (!QueryPerformanceCounter(&now)) {
+                fprintf(stderr, "[FBWIN] window-title statistics unavailable: cannot query performance counter\n");
+                title_stats = 0;
+                fb_set_window_title(hwnd, game_title);
+            } else if (now.QuadPart - title_clock.QuadPart >= title_frequency.QuadPart) {
+                LONG64 frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+                double elapsed = (double)(now.QuadPart - title_clock.QuadPart) / title_frequency.QuadPart;
+                double fps = (double)(frame - title_frame) / elapsed;
+                if (fb_format_window_title(caption, caption_capacity, game_title, fps, frame))
+                    fb_set_window_title(hwnd, caption);
+                else {
+                    title_stats = 0;
+                    fb_set_window_title(hwnd, game_title);
+                }
+                title_clock = now;
+                title_frame = frame;
+            }
         }
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
@@ -324,6 +379,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
+    free(caption);
     free(s_rgb);
     s_rgb = NULL;
     return 0;

@@ -448,17 +448,31 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 g_audio_output.peak, g_test_tone.active, g_audio_muted, sectl, fectl,
                 active, paused, pitched, d->regs[NV_PAPU_TVL2D],
                 d->regs[NV_PAPU_TVL3D], d->regs[NV_PAPU_TVLMP]);
+        fprintf(stderr, "[APU-DSP] passthrough peak=%.5f clipped=%llu nonfinite=%llu\n",
+                g_dbg.ep.mix_peak_since_report,
+                (unsigned long long)g_dbg.ep.clipped_since_report,
+                (unsigned long long)g_dbg.ep.nonfinite_since_report);
+        g_dbg.ep.mix_peak_since_report = 0.0f;
+        g_dbg.ep.clipped_since_report = g_dbg.ep.nonfinite_since_report = 0;
         for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
             struct McpxApuDebugVoice *voice = &g_dbg.vp.v[v];
             if (voice->source_peak_since_report > 0.0f ||
                 voice->mixed_peak_since_report > 0.0f) {
                 fprintf(stderr, "[APU-ROUTE] id=%u class=%s multipass=%d "
                                 "source_peak=%.5f mixed_peak=%.5f "
+                                "filtered_peak=%.5f rate=%.5f..%.5f "
+                                "filter=%u coeff=%08X/%08X filter_clipped=%llu filter_nonfinite=%llu "
                                 "bins=%u/%u/%u/%u/%u/%u/%u/%u "
                                 "vol=%03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X\n",
                         (unsigned)v, v < MCPX_HW_MAX_3D_VOICES ? "3D" : "2D",
                         voice->multipass, voice->source_peak_since_report,
                         voice->mixed_peak_since_report,
+                        voice->filtered_peak_since_report,
+                        voice->min_rate_since_report, voice->max_rate_since_report,
+                        voice->filter_mode, voice->filter_coeff[0],
+                        voice->filter_coeff[1],
+                        (unsigned long long)voice->filter_clipped_since_report,
+                        (unsigned long long)voice->filter_nonfinite_since_report,
                         voice->bin[0], voice->bin[1], voice->bin[2], voice->bin[3],
                         voice->bin[4], voice->bin[5], voice->bin[6], voice->bin[7],
                         voice->vol[0], voice->vol[1], voice->vol[2], voice->vol[3],
@@ -466,6 +480,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
             voice->source_peak_since_report = 0.0f;
             voice->mixed_peak_since_report = 0.0f;
+            voice->filtered_peak_since_report = 0.0f;
+            voice->min_rate_since_report = voice->max_rate_since_report = 0.0f;
+            voice->filter_clipped_since_report = 0;
+            voice->filter_nonfinite_since_report = 0;
         }
         int reported = 0;
         for (int v = 0; v < MCPX_HW_MAX_VOICES && reported < 8; v++) {

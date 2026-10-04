@@ -27,6 +27,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -148,6 +149,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * SFACTOR 0x0302 (SRC_ALPHA) and DFACTOR 0x0303 (ONE_MINUS_SRC_ALPHA).
  * ALPHA_TEST_ENABLE is written 390 times and left at zero, so this is
  * blending and not an alpha test. */
+#define NV097_WAIT_FOR_IDLE               0x0110
 #define NV097_SET_BLEND_ENABLE            0x0304
 #define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
 #define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
@@ -336,6 +338,8 @@ static struct {
     float transform_data[4];
     uint32_t state_shader_runs, state_shader_failures;
     double raster_seconds;
+    uint64_t gpu_attribute_fetches, gpu_attribute_skips, gpu_zero_bytes_saved;
+    double gpu_prepare_seconds, gpu_submit_seconds;
     uint32_t gpu_batches, cpu_batches;
     int combiners_configured;
     Texture extra_tex[3];
@@ -716,15 +720,65 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2], const Nv2aCpuVertex varying[3]);
 
+#ifdef _WIN32
+static int gpu_clear_surface(uint32_t param)
+{
+    static int enabled = -1;
+    Nv2aGpuDraw state = {0};
+    uint8_t *memory = (uint8_t *)xbox_GetMemoryOffset();
+    int result;
+    if (enabled < 0) {
+        const char *setting = getenv("RECOMP_NV2A_NATIVE_CLEARS");
+        enabled = !setting || strcmp(setting, "0") != 0;
+    }
+    if (!enabled || s_gpu.clip_x || s_gpu.clip_y || !s_gpu.clip_w || !s_gpu.clip_h)
+        return 0;
+    state.width = state.clip_width = s_gpu.clip_w;
+    state.height = state.clip_height = s_gpu.clip_h;
+    state.bytes_per_pixel = surface_bpp();
+    state.pitch = s_gpu.pitch;
+    state.depth_pitch = s_gpu.depth_pitch;
+    state.depth_format = (s_gpu.format >> 4) & 15u;
+    state.control0 = s_gpu.control0;
+    if (param & NV097_CLEAR_COLOR_MASK) {
+        uint32_t base = dma_resolve(s_gpu.color_offset);
+        if (!s_gpu.color_offset || !state.pitch || !state.bytes_per_pixel ||
+            state.width > state.pitch / state.bytes_per_pixel ||
+            surface_write_refused(base, state.height * state.pitch, "clear")) return 0;
+        state.color = memory + base;
+    }
+    if (param & 3u) {
+        uint32_t base = dma_resolve(s_gpu.depth_offset);
+        uint32_t bytes = state.depth_format == 1 ? 2u : state.depth_format == 2 ? 4u : 0u;
+        if (!s_gpu.depth_offset || !state.depth_pitch || !bytes || (state.control0 & 0x1000u) ||
+            state.width > state.depth_pitch / bytes ||
+            surface_write_refused(base, state.height * state.depth_pitch, "depth clear")) return 0;
+        state.depth = memory + base;
+    }
+    result = nv2a_gpu_clear(&state, param, s_gpu.clear_color, s_gpu.depth_clear);
+    if (result < 0) {
+        fprintf(stderr, "  [GPU] native clear failed: flags 0x%08X, color 0x%08X, depth 0x%08X\n",
+                param, s_gpu.color_offset, s_gpu.depth_offset);
+        fflush(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return result;
+}
+#endif
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, width;
+    int native_clear = 0;
 
-    nv2a_pb_exec_flush();
+#ifdef _WIN32
+    native_clear = gpu_clear_surface(param);
+#endif
+    if (!native_clear) nv2a_pb_exec_flush();
 
-    if ((param & 3u) && s_gpu.depth_offset && s_gpu.depth_pitch) {
+    if (!native_clear && (param & 3u) && s_gpu.depth_offset && s_gpu.depth_pitch) {
         uint32_t format = (s_gpu.format >> 4) & 15u;
         uint32_t depth_bpp = format == 1 ? 2u : format == 2 ? 4u : 0u;
         uint32_t base = dma_resolve(s_gpu.depth_offset);
@@ -760,7 +814,7 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
+    for (y = 0; !native_clear && y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
@@ -2013,6 +2067,7 @@ static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t hor
 }
 
 static uint32_t gpu_vertex_tags[65536], gpu_vertex_offsets[65536], gpu_vertex_keys[65536], gpu_vertex_serial;
+static uint32_t gpu_attribute_mask;
 
 static void gpu_begin_chunk(void)
 {
@@ -2024,6 +2079,19 @@ static void gpu_begin_chunk(void)
 }
 
 static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count);
+
+static double gpu_clock_seconds(void)
+{
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if ((!frequency.QuadPart && (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)) ||
+        !QueryPerformanceCounter(&counter)) {
+        fprintf(stderr, "[GPU-D3D11] native performance clock failed (win32 %lu)\n", GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+}
 
 static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint32_t *indices, uint32_t vertex_count)
 {
@@ -2048,12 +2116,18 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
             gpu_vertex_offsets[slot] = *count;
             gpu_indices[gpu_index_count++] = *count;
             destination = &gpu_vertices[(*count)++];
-            memset(destination, 0, sizeof *destination);
             if ((s_gpu.transform_execution_mode & 3u) == 2u) {
-                for (stage = 0; stage < 16; stage++)
-                    fetch_attr(&s_gpu.attr[stage], indices[vertex], destination->attributes[stage]);
+                memset(destination, 0, sizeof *destination);
+                for (stage = 0; stage < 16; stage++) {
+                    if (gpu_attribute_mask & (1u << stage)) {
+                        fetch_attr(&s_gpu.attr[stage], indices[vertex], destination->attributes[stage]);
+                        s_gpu.gpu_attribute_fetches++;
+                    } else s_gpu.gpu_attribute_skips++;
+                }
                 memcpy(destination->position, destination->attributes[0], sizeof destination->position);
             } else {
+                memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
+                s_gpu.gpu_zero_bytes_saved += sizeof destination->attributes;
                 fetch_attr(&s_gpu.attr[0], indices[vertex], destination->position);
                 if (!fetch_attr(color_attr(), indices[vertex], destination->diffuse))
                     nv_cpu_unpack_argb(0xFFFFFFFFu, destination->diffuse);
@@ -2079,7 +2153,8 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
     for (vertex = 0; vertex < vertex_count; vertex++) {
         gpu_indices[gpu_index_count++] = *count;
         Nv2aGpuVertex *destination = &gpu_vertices[(*count)++];
-        memset(destination, 0, sizeof *destination);
+        memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
+        s_gpu.gpu_zero_bytes_saved += sizeof destination->attributes;
         memcpy(destination->position, vertices[vertex].output[0], sizeof destination->position);
         memcpy(destination->diffuse, vertices[s_gpu.shade_mode == 0x1D00 ? vertex_count - 1 : vertex].output[3], sizeof destination->diffuse);
         memcpy(destination->specular, vertices[s_gpu.shade_mode == 0x1D00 ? vertex_count - 1 : vertex].output[4], sizeof destination->specular);
@@ -2146,6 +2221,14 @@ static int gpu_raster_batch(void)
     if ((s_gpu.transform_execution_mode & 3u) == 2u) {
         state.vertex_program = s_gpu.vp_program; state.vertex_valid = s_gpu.vp_valid;
         state.vertex_constants = s_gpu.vp_constants; state.vertex_start = s_gpu.vp_start;
+        static int fetch_all = -1;
+        if (fetch_all < 0) {
+            const char *value = getenv("RECOMP_NV2A_VERTEX_FETCH_ALL");
+            fetch_all = value && *value && strcmp(value, "0") != 0;
+        }
+        /* Position is retained for the native vertex snapshot even if the program does not read it. */
+        gpu_attribute_mask = fetch_all ? 0xFFFFu :
+            nv_cpu_vertex_input_mask(s_gpu.vp_program, s_gpu.vp_valid, s_gpu.vp_start) | 1u;
     } else if ((s_gpu.transform_execution_mode & 3u) == 0u && s_gpu.composite_valid == 0xFFFFu) {
         state.fixed_transform = 1; state.vertex_constants = s_gpu.vp_constants;
         state.lighting_enable = s_gpu.lighting_enable; state.specular_enable = s_gpu.specular_enable;
@@ -2327,7 +2410,10 @@ static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count)
     uint32_t index;
     if (!*count) return 1;
     state->indices = gpu_indices; state->index_count = gpu_index_count;
-    if (!nv2a_gpu_draw(state, gpu_vertices, *count)) {
+    double started = gpu_clock_seconds();
+    int drawn = nv2a_gpu_draw(state, gpu_vertices, *count);
+    s_gpu.gpu_submit_seconds += gpu_clock_seconds() - started;
+    if (!drawn) {
         static uint32_t seen[16], shown;
         uint32_t key = state->stage_program ^ state->control0 ^ (state->depth_enable << 24) ^ (state->blend_source << 16) ^ state->blend_destination;
         for (index = 0; index < shown; index++) if (seen[index] == key) return 0;
@@ -2384,7 +2470,11 @@ static void raster_batch(void)
     }
 
 #ifdef _WIN32
-    if (gpu_raster_batch()) return;
+    double started = gpu_clock_seconds();
+    double prior_submit = s_gpu.gpu_submit_seconds;
+    int rendered = gpu_raster_batch();
+    s_gpu.gpu_prepare_seconds += gpu_clock_seconds() - started - (s_gpu.gpu_submit_seconds - prior_submit);
+    if (rendered) return;
     fprintf(stderr, "[GPU-D3D11] unsupported batch: primitive %u count %u; hardware rendering required\n", s_gpu.prim, s_gpu.idx_count);
     for (uint32_t i = 0; i < 4; i++) {
         const Texture *texture = i ? &s_gpu.extra_tex[i - 1] : &s_gpu.tex;
@@ -2456,7 +2546,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && getenv("RECOMP_PB_EXEC_VERBOSE"))
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -2847,6 +2937,29 @@ static void append_vertex_index(uint32_t index)
     if (index > 65535u) s_gpu.wide_indices++;
 }
 
+void nv2a_pb_exec_indices(uint32_t method, const uint32_t *parameters, uint32_t count)
+{
+    if (!parameters || !count || count > 2047u ||
+        (method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)) {
+        fprintf(stderr, "[GPU] invalid bulk index packet: method %04X count %u\n", method, count);
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    require_index_capacity(count * (method == NV097_ARRAY_ELEMENT16 ? 2u : 1u), method);
+    for (uint32_t word = 0; word < count; word++) {
+        uint32_t parameter = parameters[word];
+        if (method == NV097_ARRAY_ELEMENT16) {
+            append_vertex_index(parameter & 0xFFFFu);
+            append_vertex_index(parameter >> 16);
+        } else append_vertex_index(parameter);
+    }
+    if (method == NV097_ARRAY_ELEMENT16) s_gpu.array16_indices += (uint64_t)count * 2;
+    else {
+        s_gpu.array32_indices += count;
+        s_gpu.batch_array32_count += count;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -2931,6 +3044,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(subch, method, param);
+        return;
+    }
+    if (method == NV097_WAIT_FOR_IDLE) {
+        nv2a_pb_exec_flush();
         return;
     }
     if (method == 0x0100) {
@@ -3708,7 +3825,14 @@ void nv2a_pb_exec_report(void)
             (unsigned long long)s_gpu.native_array32_batches);
     fprintf(stderr, "[GPU-D3D11] index storage: %u peak batch indices, %u allocated capacity\n",
             s_gpu.max_index_count, s_gpu.idx_capacity);
+    fprintf(stderr, "[GPU-D3D11] vertex preparation: %llu program attribute fetches, %llu unused skipped; %.3f GiB zeroing avoided\n",
+            (unsigned long long)s_gpu.gpu_attribute_fetches,
+            (unsigned long long)s_gpu.gpu_attribute_skips,
+            (double)s_gpu.gpu_zero_bytes_saved / (1024.0 * 1024 * 1024));
+    fprintf(stderr, "[GPU-D3D11] executor time: preparation %.3fs backend %.3fs\n",
+            s_gpu.gpu_prepare_seconds, s_gpu.gpu_submit_seconds);
     nv2a_gpu_report();
+    xbox_Nv2aSoftwareMethodReport();
 #ifdef _WIN32
     static clock_t previous_time;
     static uint32_t previous_flips;

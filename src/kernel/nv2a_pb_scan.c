@@ -71,19 +71,22 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_flush(void);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+static int s_bulk_indices = -1;
+static uint64_t s_bulk_index_packets, s_bulk_index_words;
+extern void nv2a_pb_exec_indices(uint32_t method, const uint32_t *parameters, uint32_t count);
 
-static void note(uint32_t subch, uint32_t method)
+static void note(uint32_t subch, uint32_t method, uint32_t count)
 {
     uint16_t *slot = subch < 8 && method <= 0x1FFCu && !(method & 3u) ? &s_seen_slots[subch][method >> 2] : NULL;
     if (slot) {
         if (*slot && *slot <= s_seen_count && s_seen[*slot - 1].method == method && s_seen[*slot - 1].subch == subch) {
-            s_seen[*slot - 1].count++;
+            s_seen[*slot - 1].count += count;
             return;
         }
     } else {
         for (int index = 0; index < s_seen_count; index++) {
             if (s_seen[index].method == method && s_seen[index].subch == subch) {
-                s_seen[index].count++;
+                s_seen[index].count += count;
                 return;
             }
         }
@@ -102,7 +105,7 @@ static void note(uint32_t subch, uint32_t method)
     if (s_seen_count < PB_MAX_METHODS) {
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
+        s_seen[s_seen_count].count  = count;
         s_seen_count++;
         if (slot) *slot = (uint16_t)s_seen_count;
     }
@@ -165,8 +168,12 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0)
+    if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
+        fprintf(stderr, "[PB] bulk indices: %llu packets, %llu parameter words; %llu per-word GET updates avoided\n",
+                (unsigned long long)s_bulk_index_packets, (unsigned long long)s_bulk_index_words,
+                (unsigned long long)(s_bulk_index_words - s_bulk_index_packets));
+    }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
@@ -237,6 +244,11 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         s_exec_enabled = 1;
     if (s_failure_trace < 0)
         s_failure_trace = getenv("RECOMP_PB_FAILURE_TRACE") != NULL;
+    if (s_bulk_indices < 0) {
+        const char *value = getenv("RECOMP_PB_BULK_INDICES");
+        s_bulk_indices = (!value || strcmp(value, "0") != 0) &&
+                         !s_failure_trace && !getenv("RECOMP_PB_EXEC_VERBOSE");
+    }
     if (end_va == start_va)
         return;
     if (s_exec_enabled) {
@@ -258,6 +270,29 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);
             fflush(stderr); _Exit(EXIT_FAILURE);
         }
+        if (s_bulk_indices && s_exec_enabled && pending_count && pending_noninc &&
+            pending_subch == 0 && (pending_method == 0x1800u || pending_method == 0x1808u) &&
+            va < end_va && !(end_va & 3u)) {
+            uint32_t count = pending_count;
+            uint32_t available = (end_va - va) / 4;
+            uint64_t mapped = ((uint64_t)address_base + XBOX_CONTIG_SIZE - va) / 4;
+            if (count > available) count = available;
+            if (count > mapped) count = (uint32_t)mapped;
+            if (count > 0x100000u - words) count = 0x100000u - words;
+            if (count) {
+                /* Indices have no guest-visible side effects; retain GET until all source words are copied. */
+                nv2a_pb_exec_indices(pending_method, (const uint32_t *)(mem + va), count);
+                note(pending_subch, pending_method, count);
+                va += count * 4;
+                words += count;
+                pending_count -= count;
+                pending_next = va;
+                *dma_get = va & 0x0FFFFFFFu;
+                s_bulk_index_packets++;
+                s_bulk_index_words += count;
+                continue;
+            }
+        }
         uint32_t w = *(const uint32_t *)(mem + va);
         if (s_failure_trace) {
             s_history[s_history_next].va = va;
@@ -272,7 +307,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if (pending_count) {
-            note(pending_subch, pending_method);
+            note(pending_subch, pending_method, 1);
             if (s_exec_enabled) {
                 /* Publish the fetched parameter before its semaphore or
                  * callback can wake a CPU rewriting later command words. */
@@ -340,5 +375,5 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
-    if (s_exec_enabled) nv2a_pb_exec_flush();
+    if (s_exec_enabled && !xbox_Nv2aNativeFencesEnabled()) nv2a_pb_exec_flush();
 }
