@@ -39,6 +39,11 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+KIRQL __stdcall xbox_KeGetCurrentIrql(void)
+{
+    return g_current_irql;
+}
+
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
  *
  * The level itself is per-thread, which is right for a guest that asks "what

@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "../apu/apu.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -1284,23 +1285,36 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+static KIRQL bridge_raise_irql(KIRQL new_irql)
+{
+    KIRQL old_irql = xbox_KfRaiseIrql(new_irql);
+    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) = new_irql;
+    return old_irql;
+}
+
+static void bridge_lower_irql(KIRQL new_irql)
+{
+    xbox_KfLowerIrql(new_irql);
+    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) = new_irql;
+}
+
 static void bridge_KfRaiseIrql(void)
 {
     uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)bridge_raise_irql((UCHAR)new_irql);
 }
 
 static void bridge_KfLowerIrql(void)
 {
     uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    bridge_lower_irql((UCHAR)new_irql);
     g_eax = 0;
 }
 
 /* ── KeRaiseIrqlToDpcLevel (ordinal 129) ─────────────────── */
 static void bridge_KeRaiseIrqlToDpcLevel(void)
 {
-    g_eax = (uint32_t)xbox_KeRaiseIrqlToDpcLevel();
+    g_eax = (uint32_t)bridge_raise_irql(DISPATCH_LEVEL);
 }
 
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
@@ -1829,11 +1843,7 @@ static void bridge_HalReadSMCTrayState(void)
  * interrupt enable and queues here, and the enumeration it should have started
  * lives entirely in the deferred routine.
  *
- * ponytail: runs the routine inline rather than queueing it. A real DPC runs
- * at DISPATCH_LEVEL shortly after the ISR returns, and this runs it before the
- * ISR returns, on whichever thread queued it. That ordering difference has not
- * mattered for anything here yet; when it does, the upgrade is a real queue
- * drained by the thread that lowered IRQL, not a second call site.
+ * The timer thread drains the queue at DISPATCH_LEVEL after the ISR returns.
  */
 /* Run a DPC's deferred routine on the calling thread.
  *
@@ -1848,6 +1858,7 @@ static void bridge_HalReadSMCTrayState(void)
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
+    KIRQL old_irql;
     recomp_func_t fn;
     static int trace = -1;
     static unsigned trace_count;
@@ -1880,7 +1891,9 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    old_irql = bridge_raise_irql(DISPATCH_LEVEL);
     fn();
+    bridge_lower_irql(old_irql);
     return 1;
 }
 
@@ -1895,16 +1908,21 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
  * asks for exclusive access, is told it did not get it, and skips the work.
  *
- * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
- * caller that matters is a device model on its own thread; if two of those
- * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * IRQL is raised and restored, but the interrupt object's spinlock is not
+ * yet modeled.
  */
 static void bridge_KeSynchronizeExecution(void)
 {
+    uint32_t interrupt_va = STACK_ARG(0);
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
+    KIRQL old_irql, new_irql;
     recomp_func_t fn;
+
+    if (!bridge_buf_ok(interrupt_va, 44, "KeSynchronizeExecution")) {
+        g_eax = 0;
+        return;
+    }
 
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn && routine) fn = recomp_lookup_manual(routine);
@@ -1920,7 +1938,13 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    new_irql = (KIRQL)BRIDGE_MEM32(interrupt_va + 12);
+    old_irql = xbox_KeGetCurrentIrql();
+    if (new_irql < old_irql)
+        new_irql = old_irql;
+    bridge_raise_irql(new_irql);
     fn();
+    bridge_lower_irql(old_irql);
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -1950,7 +1974,7 @@ static void bridge_KeRemoveQueueDpc(void)
  * Queued properly now, and drained by the timer thread, which is the one thread
  * here that already has a guest stack and a TIB and runs nothing else urgent.
  *
- * ponytail: one queue, no IRQL, no per-processor list, and a DPC queued from a
+ * ponytail: one queue, no per-processor list, and a DPC queued from a
  * DPC runs on the next drain rather than immediately. Nothing here depends on
  * DPC ordering beyond "after the ISR".
  */
@@ -2000,6 +2024,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
     uint32_t routine, context;
     recomp_func_t fn;
+    KIRQL old_irql;
 
     if (!kint)
         return -1;
@@ -2015,7 +2040,9 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    old_irql = bridge_raise_irql((KIRQL)BRIDGE_MEM32(kint + 12));
     fn();
+    bridge_lower_irql(old_irql);
     return (int)(g_eax & 1u);
 }
 
@@ -2080,6 +2107,21 @@ static void kernel_vblank_tick(void)
 
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
+static void kernel_apu_tick(void)
+{
+    static unsigned reports;
+    if (!mcpx_apu_irq_pending() || xbox_IrqlBlocksInterrupts())
+        return;
+    {
+        int claimed = kernel_raise_interrupt(5u);
+        if (reports++ < 3) {
+            fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
+                    claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+    }
+}
+
 static void kernel_drain_dpcs(void)
 {
     while (g_dpc_head != g_dpc_tail) {
@@ -2170,6 +2212,7 @@ static void bridge_KeInitializeInterrupt(void)
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    BRIDGE_MEM32(interrupt_va + 12) = (uint8_t)STACK_ARG(4);
     g_eax = 0;
 }
 
@@ -2186,6 +2229,7 @@ static void bridge_KeInitializeInterrupt(void)
  */
 #define XBOX_MAX_VECTORS 32
 static uint32_t g_connected_isr[XBOX_MAX_VECTORS];   /* KINTERRUPT guest VA */
+static int kernel_start_timer(void);
 
 /* BOOLEAN KeConnectInterrupt(PKINTERRUPT Interrupt) */
 static void bridge_KeConnectInterrupt(void)
@@ -2195,6 +2239,10 @@ static void bridge_KeConnectInterrupt(void)
     if (interrupt_va) {
         uint32_t vector = BRIDGE_MEM32(interrupt_va + 8);
         if (vector < XBOX_MAX_VECTORS) {
+            if (vector == 5u && !kernel_start_timer()) {
+                g_eax = 0;
+                return;
+            }
             g_connected_isr[vector] = interrupt_va;
             fprintf(stderr, "  [KERNEL] KeConnectInterrupt: vector %u -> "
                             "routine 0x%08X context 0x%08X\n",
@@ -2306,10 +2354,9 @@ static void bridge_KeInitializeTimerEx(void)
  * absolute due time is treated as immediate, which is wrong in principle and
  * has not come up in practice.
  *
- * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
- * by up to a tick and a periodic timer drifts. Nothing here is scheduling
- * audio off a timer. A title that needs better wants the host's timer queue,
- * not a smaller sleep.
+ * One thread and a fixed table. A connected APU needs 1 ms interrupt polling:
+ * its 256-sample output packets last only 5.33 ms. Without an APU ISR the
+ * original 10 ms timer tick is retained.
  */
 #define XBOX_MAX_TIMERS 32
 typedef struct {
@@ -2321,6 +2368,7 @@ typedef struct {
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
+static INIT_ONCE g_timer_once = INIT_ONCE_STATIC_INIT;
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2353,7 +2401,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        Sleep(xbox_GetConnectedInterrupt(5u) ? 1 : 10);
+        kernel_apu_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -2391,6 +2440,27 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 }
 
+static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    HANDLE thread;
+    (void)once; (void)parameter; (void)context;
+    InitializeCriticalSection(&g_timer_lock);
+    thread = CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL);
+    if (!thread) {
+        fprintf(stderr, "  [KERNEL] Cannot start timer/interrupt thread: error %lu\n", GetLastError());
+        DeleteCriticalSection(&g_timer_lock);
+        return FALSE;
+    }
+    g_timer_started = 1;
+    CloseHandle(thread);
+    return TRUE;
+}
+
+static int kernel_start_timer(void)
+{
+    return InitOnceExecuteOnce(&g_timer_once, kernel_timer_init, NULL, NULL) != FALSE;
+}
+
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
@@ -2399,10 +2469,9 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    if (!kernel_start_timer()) {
+        g_eax = 0;
+        return;
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -7052,11 +7121,10 @@ static void bridge_KiUnlockDispatcherDatabase(void)
 }
 
 /* --- KeGetCurrentIrql (ordinal 103, 0 args = 0 bytes)
- * Stack-based with 0 args (not the Kf* fastcall form). IRQL is unmounted, so
- * report PASSIVE_LEVEL. */
+ * Stack-based with 0 args (not the Kf* fastcall form). */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    g_eax = (uint32_t)xbox_KeGetCurrentIrql();
 }
 
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */

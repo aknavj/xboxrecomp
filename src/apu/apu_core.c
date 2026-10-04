@@ -24,12 +24,24 @@
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 
+#if defined(_WIN32)
+#include <avrt.h>
+#endif
+
 /* ============================================================
  * Globals
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
 static APUPhysicalMemoryMapper g_apu_physical_mapper;
+
+bool mcpx_apu_diagnostics_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("RECOMP_APU_DIAG") != NULL;
+    return enabled != 0;
+}
 
 uint8_t *mcpx_apu_ram_address(uint64_t physical, uint32_t bytes)
 {
@@ -64,29 +76,41 @@ volatile int g_audio_muted = 0;  /* 0 = audio enabled */
  * Debug frame markers (minimal stubs)
  * ============================================================ */
 
-void mcpx_debug_begin_frame(void) {}
+void mcpx_debug_begin_frame(void)
+{
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        g_dbg.vp.v[v].active = false;
+        g_dbg.vp.v[v].paused = false;
+    }
+}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * IRQ handling
  * ============================================================ */
 
 static void update_irq(MCPXAPUState *d)
 {
-    if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+    if ((qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
+        == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
     }
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
         pci_irq_assert(PCI_DEVICE(d));
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         pci_irq_deassert(PCI_DEVICE(d));
     }
+
+}
+
+int mcpx_apu_irq_pending(void)
+{
+    return g_state &&
+        (qatomic_read(&g_state->regs[NV_PAPU_ISTS]) & NV_PAPU_ISTS_GINTSTS) != 0;
 }
 
 /* ============================================================
@@ -100,7 +124,7 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        r = (uint32_t)qatomic_fetch_add(&d->ep_frame_div, 0) * NUM_SAMPLES_PER_FRAME;
         break;
     default:
         if (addr < 0x20000) {
@@ -134,6 +158,10 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         update_irq(d);
         qemu_cond_broadcast(&d->cond);
         break;
+    case NV_PAPU_IEN:
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        update_irq(d);
+        break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
@@ -163,6 +191,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
             }
         }
+        update_irq(d);
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:
@@ -399,14 +428,59 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     unsigned long now = (unsigned long)GetTickCount();
     if (diagnostic && now - g_audio_output.last_report >= 1000) {
         g_audio_output.last_report = now;
+        uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        int active = 0, paused = 0, pitched = 0;
+        for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+            if (!g_dbg.vp.v[v].active) continue;
+            active++;
+            paused += g_dbg.vp.v[v].paused;
+            pitched += fabsf(g_dbg.vp.v[v].rate - 1.0f) > 0.0001f;
+        }
         fprintf(stderr, "[APU-OUT] %s blocks=%llu frames=%llu nonzero=%llu "
-                        "hardware_nonzero=%llu peak=%d tone=%d muted=%d\n",
+                        "hardware_nonzero=%llu peak=%d tone=%d muted=%d sectl=%08X fectl=%08X "
+                        "voices=%d paused=%d pitched=%d lists=%04X/%04X/%04X\n",
                 xa2_is_active() ? "XAudio2" : "waveOut",
                 (unsigned long long)g_audio_output.blocks,
                 (unsigned long long)g_audio_output.frames,
                 (unsigned long long)g_audio_output.nonzero,
                 (unsigned long long)g_audio_output.hardware_nonzero,
-                g_audio_output.peak, g_test_tone.active, g_audio_muted);
+                g_audio_output.peak, g_test_tone.active, g_audio_muted, sectl, fectl,
+                active, paused, pitched, d->regs[NV_PAPU_TVL2D],
+                d->regs[NV_PAPU_TVL3D], d->regs[NV_PAPU_TVLMP]);
+        for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+            struct McpxApuDebugVoice *voice = &g_dbg.vp.v[v];
+            if (voice->source_peak_since_report > 0.0f ||
+                voice->mixed_peak_since_report > 0.0f) {
+                fprintf(stderr, "[APU-ROUTE] id=%u class=%s multipass=%d "
+                                "source_peak=%.5f mixed_peak=%.5f "
+                                "bins=%u/%u/%u/%u/%u/%u/%u/%u "
+                                "vol=%03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X\n",
+                        (unsigned)v, v < MCPX_HW_MAX_3D_VOICES ? "3D" : "2D",
+                        voice->multipass, voice->source_peak_since_report,
+                        voice->mixed_peak_since_report,
+                        voice->bin[0], voice->bin[1], voice->bin[2], voice->bin[3],
+                        voice->bin[4], voice->bin[5], voice->bin[6], voice->bin[7],
+                        voice->vol[0], voice->vol[1], voice->vol[2], voice->vol[3],
+                        voice->vol[4], voice->vol[5], voice->vol[6], voice->vol[7]);
+            }
+            voice->source_peak_since_report = 0.0f;
+            voice->mixed_peak_since_report = 0.0f;
+        }
+        int reported = 0;
+        for (int v = 0; v < MCPX_HW_MAX_VOICES && reported < 8; v++) {
+            const struct McpxApuDebugVoice *voice = &g_dbg.vp.v[v];
+            if (!voice->active) continue;
+            fprintf(stderr, "[APU-VOICE] id=%u paused=%d stream=%d persist=%d rate=%.4f "
+                            "envelope=%.3f source_peak=%.4f cbo=%u ebo=%u ssl=%u/%u segment=%d/%d "
+                            "starved_reads=%llu\n",
+                    (unsigned)v, voice->paused, voice->stream, voice->persist, voice->rate,
+                    voice->amplitude_envelope, voice->source_peak, voice->cbo, voice->ebo,
+                    d->vp.ssl[v].count[0], d->vp.ssl[v].count[1],
+                    d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg,
+                    (unsigned long long)voice->starved_reads);
+            reported++;
+        }
     }
 }
 
@@ -422,8 +496,10 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Preserve packet deadlines across short scheduling delays. Submission
+     * backpressure limits the queue while up to eight packets catch up. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 8 * EP_FRAME_US) {
         d->next_frame_time_us = now_us;
     }
 
@@ -468,10 +544,14 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
+    if (d->set_irq) {
+        d->set_irq = false;
+        update_irq(d);
+    }
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 
-    d->ep_frame_div++;
+    qatomic_fetch_add(&d->ep_frame_div, 1);
 
     mcpx_debug_end_frame();
 }
@@ -483,6 +563,17 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(_WIN32)
+    DWORD audio_task_index = 0;
+    HANDLE audio_task = AvSetMmThreadCharacteristicsA("Audio", &audio_task_index);
+    if (!audio_task) {
+        fprintf(stderr, "[APU] MMCSS audio registration failed: error %lu\n",
+                GetLastError());
+    } else if (!AvSetMmThreadPriority(audio_task, AVRT_PRIORITY_HIGH)) {
+        fprintf(stderr, "[APU] MMCSS audio priority failed: error %lu\n",
+                GetLastError());
+    }
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -505,9 +596,10 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        uint32_t mode = fectl & NV_PAPU_FECTL_FEMETHMODE;
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+                          mode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
+                          mode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
@@ -516,11 +608,17 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
-            d->ep_frame_div++;
+            qatomic_fetch_add(&d->ep_frame_div, 1);
         }
     }
 
     qemu_mutex_unlock(&d->lock);
+#if defined(_WIN32)
+    if (audio_task && !AvRevertMmThreadCharacteristics(audio_task)) {
+        fprintf(stderr, "[APU] MMCSS audio cleanup failed: error %lu\n",
+                GetLastError());
+    }
+#endif
     return NULL;
 }
 
@@ -665,7 +763,9 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         /* VP region */
         hwaddr vp_addr = addr - 0x20000;
         if (is_write) {
+            qemu_mutex_lock(&d->lock);
             mcpx_apu_vp_write(d, vp_addr, val, size);
+            qemu_mutex_unlock(&d->lock);
         }
         /* VP reads handled by caller if needed */
     } else if (addr < 0x20000) {
@@ -685,6 +785,11 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
+    if (size == 8) {
+        uint64_t low = mcpx_apu_mmio_read(d, addr, 4);
+        uint64_t high = mcpx_apu_mmio_read(d, addr + 4, 4);
+        return low | (high << 32);
+    }
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
@@ -696,6 +801,13 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     if (!d) return;
+    if (size == 8) {
+        qemu_mutex_lock(&d->lock);
+        mcpx_apu_dispatch_mmio(d, (hwaddr)addr, (uint32_t)val, 4, true);
+        mcpx_apu_dispatch_mmio(d, (hwaddr)(addr + 4), (uint32_t)(val >> 32), 4, true);
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
 }
 
