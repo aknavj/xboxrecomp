@@ -121,10 +121,21 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+static void fb_exit_process(void)
+{
+    InterlockedExchange(&s_fb_running, 0);
+    fprintf(stderr, "[FBWIN] close requested; exiting process\n");
+    fflush(stderr);
+    ExitProcess(EXIT_SUCCESS);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        fb_exit_process();
+        return 0;
+
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
@@ -266,6 +277,51 @@ static void fb_set_window_title(HWND hwnd, const char *caption)
         fprintf(stderr, "[FBWIN] failed to update window title: error %lu\n", GetLastError());
 }
 
+typedef struct {
+    HICON large_icon, small_icon;
+    int found;
+} FbWindowIcons;
+
+static BOOL CALLBACK fb_load_icon_resource(HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR context)
+{
+    FbWindowIcons *icons = (FbWindowIcons *)context;
+    (void)type;
+    icons->found = 1;
+    icons->large_icon = (HICON)LoadImageW(module, name, IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    if (!icons->large_icon)
+        fprintf(stderr, "[FBWIN] cannot load executable large icon: error %lu\n", GetLastError());
+    icons->small_icon = (HICON)LoadImageW(module, name, IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    if (!icons->small_icon)
+        fprintf(stderr, "[FBWIN] cannot load executable small icon: error %lu\n", GetLastError());
+    return FALSE;
+}
+
+static void fb_load_window_icons(HMODULE module, FbWindowIcons *icons)
+{
+    if (!EnumResourceNamesW(module, (LPCWSTR)RT_GROUP_ICON, fb_load_icon_resource, (LONG_PTR)icons)
+        && !icons->found) {
+        DWORD error = GetLastError();
+        if (error == ERROR_RESOURCE_TYPE_NOT_FOUND || error == ERROR_RESOURCE_DATA_NOT_FOUND)
+            fprintf(stderr, "[FBWIN] executable has no icon resource; using Windows default\n");
+        else
+            fprintf(stderr, "[FBWIN] cannot enumerate executable icons: error %lu\n", error);
+    }
+    if (!icons->large_icon) {
+        icons->large_icon = (HICON)LoadImageW(NULL, MAKEINTRESOURCEW(32512), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+        if (!icons->large_icon)
+            fprintf(stderr, "[FBWIN] cannot load default large icon: error %lu\n", GetLastError());
+    }
+    if (!icons->small_icon) {
+        icons->small_icon = (HICON)LoadImageW(NULL, MAKEINTRESOURCEW(32512), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+        if (!icons->small_icon)
+            fprintf(stderr, "[FBWIN] cannot load default small icon: error %lu\n", GetLastError());
+    }
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -279,6 +335,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     LARGE_INTEGER title_frequency, title_clock;
     LONG64 title_frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
     int title_stats = caption != NULL;
+    HMODULE module = GetModuleHandleA(NULL);
+    FbWindowIcons icons = {0};
 
     (void)unused;
     if (!caption)
@@ -291,13 +349,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         title_stats = 0;
 
     {
-        WNDCLASSA wc;
+        WNDCLASSEXA wc;
         memset(&wc, 0, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
         wc.lpfnWndProc   = fb_wndproc;
-        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.hInstance     = module;
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        fb_load_window_icons(module, &icons);
+        wc.hIcon         = icons.large_icon;
+        wc.hIconSm       = icons.small_icon;
         wc.lpszClassName = "XboxRecompFramebuffer";
-        RegisterClassA(&wc);
+        if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            fprintf(stderr, "[FBWIN] framebuffer class registration failed: error %lu\n", GetLastError());
+            InterlockedExchange(&s_fb_running, 0);
+            free(caption);
+            return 0;
+        }
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
@@ -306,12 +373,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+                           NULL, NULL, module, NULL);
     if (!hwnd) {
+        fprintf(stderr, "[FBWIN] framebuffer window creation failed: error %lu\n", GetLastError());
         InterlockedExchange(&s_fb_running, 0);
         free(caption);
         return 0;
     }
+    SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icons.large_icon);
+    SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icons.small_icon);
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -330,9 +400,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT)
+                fb_exit_process();
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        if (!InterlockedCompareExchange(&s_fb_running, 1, 1))
+            break;
         if (title_stats) {
             LARGE_INTEGER now;
             if (!QueryPerformanceCounter(&now)) {
