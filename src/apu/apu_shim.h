@@ -175,7 +175,8 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
  * libsamplerate stubs (SRC)
  *
  * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * The standalone VP uses its own stateful linear resampler; these SRC API
+ * placeholders remain for the extracted DSP/filter structures.
  * ============================================================ */
 
 typedef void SRC_STATE;
