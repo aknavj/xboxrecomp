@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "recomp_icall_feedback.h"
+#include "../video/fb_present.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1701,6 +1702,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
     }
     fflush(stderr);
     RECOMP_ICALL_FEEDBACK_DUMP();
+    xbox_FramebufferStatsReport();
     _exit(3);
     return 0;
 }

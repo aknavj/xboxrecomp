@@ -508,6 +508,141 @@ static void test_gpu_scissor_coverage(void)
     }
 }
 
+static void test_gpu_rejected_outputs(void)
+{
+    uint32_t color[64], depth[64], saved_color[64], saved_depth[64];
+    Nv2aGpuDraw state = {0};
+    Nv2aGpuVertex vertices[3] = {0};
+    uint32_t format, scenario, vertex, pixel;
+    state.color = (uint8_t *)color; state.depth = (uint8_t *)depth;
+    state.width = state.height = state.clip_width = state.clip_height = 8;
+    state.pitch = state.depth_pitch = 32; state.bytes_per_pixel = 4;
+    state.color_mask = 0x01010101; state.depth_enable = state.depth_mask = 1;
+    vertices[1].position[0] = vertices[2].position[1] = 16;
+    for (vertex = 0; vertex < 3; vertex++) {
+        vertices[vertex].position[2] = 100; vertices[vertex].position[3] = 1;
+        vertices[vertex].diffuse[0] = vertices[vertex].diffuse[3] = 1;
+    }
+    for (format = 1; format <= 2; format++) {
+        state.depth_format = format;
+        for (pixel = 0; pixel < 64; pixel++) { color[pixel] = 0xFF112233; depth[pixel] = 0xFFFFFFA5; }
+        state.depth_function = 0x200;
+        check("NEVER depth draw executes", nv2a_gpu_draw(&state, vertices, 3));
+        color[9] = 0xFF314159; depth[9] = 0x000011CD;
+        memcpy(saved_color, color, sizeof color); memcpy(saved_depth, depth, sizeof depth);
+        nv2a_gpu_flush();
+        check("NEVER depth preserves concurrent CPU color", !memcmp(color, saved_color, sizeof color));
+        check("NEVER depth preserves concurrent CPU depth and stencil", !memcmp(depth, saved_depth, sizeof depth));
+        state.depth_function = 0x207;
+        check("accepted output before rejected draw", nv2a_gpu_draw(&state, vertices, 3));
+        state.depth_function = 0x200;
+        check("rejected draw after pending output", nv2a_gpu_draw(&state, vertices, 3));
+        nv2a_gpu_flush();
+        check("rejection does not discard earlier dirty color", color[9] == 0xFFFF0000);
+        if (format == 2) check("rejection does not discard earlier dirty depth/stencil", depth[9] == 0x000064CD);
+        else {
+            uint16_t stored; memcpy(&stored, (uint8_t *)depth + 34, 2);
+            check("rejection does not discard earlier dirty Z16", stored == 100);
+        }
+        nv2a_gpu_invalidate();
+    }
+    state.depth_format = 2; state.stencil_enable = 1;
+    state.stencil_read_mask = state.stencil_write_mask = 255; state.stencil_reference = 3;
+    for (scenario = 0; scenario < 5; scenario++) {
+        state.stencil_function = scenario == 0 || scenario == 3 ? 0x200 : 0x207;
+        state.depth_function = scenario == 1 || scenario == 4 ? 0x200 : 0x207;
+        state.depth_enable = scenario != 2;
+        state.color_mask = scenario == 2 ? 0 : 0x01010101;
+        state.stencil_fail = scenario == 0 ? 0x1E00 : 0x1E01;
+        state.stencil_depth_fail = scenario == 1 ? 0x1E00 : 0x1E01;
+        state.stencil_pass = scenario == 2 ? 0x1E00 : 0x1E01;
+        for (pixel = 0; pixel < 64; pixel++) { color[pixel] = 0xFF112233; depth[pixel] = 0x000064A5; }
+        check("stencil reachability draw executes", nv2a_gpu_draw(&state, vertices, 3));
+        color[9] = 0xFF314159;
+        if (scenario < 3) depth[9] = 0x000011CD;
+        memcpy(saved_color, color, sizeof color); memcpy(saved_depth, depth, sizeof depth);
+        if (scenario >= 3) saved_depth[9] = 0x00006403;
+        nv2a_gpu_flush();
+        check("unreachable stencil operations preserve CPU color", !memcmp(color, saved_color, sizeof color));
+        if (scenario < 3)
+            check("unreachable stencil operations preserve CPU depth", !memcmp(depth, saved_depth, sizeof depth));
+        else check("reachable stencil failure operation still publishes", depth[9] == saved_depth[9]);
+        nv2a_gpu_invalidate();
+    }
+}
+
+static void test_gpu_publication_benchmark(void)
+{
+    enum { width = 640, height = 480, pitch = width * 4 + 16, iterations = 256 };
+    static uint8_t color[pitch * height], depth[pitch * height];
+    Nv2aGpuDraw state = {0};
+    Nv2aGpuVertex vertices[3] = {0};
+    uint32_t format, pass, row, column, vertex;
+    state.color = color; state.depth = depth;
+    state.width = state.clip_width = width; state.height = state.clip_height = height;
+    state.pitch = state.depth_pitch = pitch; state.bytes_per_pixel = 4;
+    state.color_mask = 0x01010101; state.depth_enable = state.depth_mask = 1;
+    state.depth_function = 0x207;
+    vertices[1].position[0] = width * 2; vertices[2].position[1] = height * 2;
+    for (vertex = 0; vertex < 3; vertex++) {
+        vertices[vertex].position[3] = 1;
+        vertices[vertex].diffuse[0] = vertices[vertex].diffuse[3] = 1;
+    }
+    for (format = 1; format <= 2; format++) {
+        LARGE_INTEGER frequency, start, end;
+        uint32_t bytes = format == 1 ? 2 : 4;
+        state.depth_format = format;
+        memset(color, 0x35, sizeof color); memset(depth, 0xA5, sizeof depth);
+        for (vertex = 0; vertex < 3; vertex++) vertices[vertex].position[2] = 100;
+        check("publication benchmark warm draw", nv2a_gpu_draw(&state, vertices, 3));
+        nv2a_gpu_flush();
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
+        for (pass = 0; pass < iterations; pass++) {
+            for (vertex = 0; vertex < 3; vertex++) vertices[vertex].position[2] = (float)(100 + pass);
+            if (pass % 16 == 0) {
+                for (row = 0; row < height; row++)
+                    memset(depth + row * pitch, 0xA5, width * bytes);
+            }
+            check("publication benchmark draw", nv2a_gpu_draw(&state, vertices, 3));
+            nv2a_gpu_flush();
+        }
+        QueryPerformanceCounter(&end);
+        printf("publication benchmark D%u: %.3f ms, %u synchronized draws\n",
+               format == 1 ? 16 : 24, (double)(end.QuadPart - start.QuadPart) * 1000 / frequency.QuadPart,
+               iterations);
+        for (row = 0; row < height; row++) {
+            for (column = 0; column < width; column++) {
+                uint32_t stored_color, stored_depth = 0;
+                memcpy(&stored_color, color + row * pitch + column * 4, 4);
+                memcpy(&stored_depth, depth + row * pitch + column * bytes, bytes);
+                check("publication benchmark exact color", stored_color == 0xFFFF0000);
+                check("publication benchmark exact depth/stencil",
+                      stored_depth == (format == 1 ? 100 + iterations - 1 : ((100 + iterations - 1) << 8) | 0xA5));
+            }
+            for (column = width * 4; column < pitch; column++)
+                check("publication benchmark color padding", color[row * pitch + column] == 0x35);
+            for (column = width * bytes; column < pitch; column++)
+                check("publication benchmark depth padding", depth[row * pitch + column] == 0xA5);
+        }
+        nv2a_gpu_invalidate();
+    }
+    nv2a_gpu_report();
+    {
+        LARGE_INTEGER frequency, start, end;
+        state.depth_function = 0x200;
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
+        for (pass = 0; pass < iterations; pass++) {
+            check("rejected-output benchmark draw", nv2a_gpu_draw(&state, vertices, 3));
+            nv2a_gpu_flush();
+        }
+        QueryPerformanceCounter(&end);
+        printf("publication benchmark NEVER: %.3f ms, %u synchronized draws\n",
+               (double)(end.QuadPart - start.QuadPart) * 1000 / frequency.QuadPart, iterations);
+        nv2a_gpu_invalidate();
+    }
+    nv2a_gpu_report();
+}
+
 static int gpu_decode_cube(void *context, uint32_t face, uint32_t horizontal, uint32_t vertical, uint32_t *color)
 {
     (void)horizontal; (void)vertical;
@@ -1128,6 +1263,17 @@ int main(int argument_count, char **arguments)
     check("register aperture rejects out-of-bounds span",
           xbox_Nv2aRegisterPointer(sizeof nv2a_registers - 4, 8) == NULL);
     if (argument_count == 2 && !strncmp(arguments[1], "--pb-", 5)) return invalid_pushbuffer_case(arguments[1]);
+    if (getenv("NV2A_GPU_PUBLICATION_ONLY")) {
+        _putenv_s("RECOMP_GPU_EXPERIMENTAL_DEPTH", "1");
+        check("publication D3D11 device", nv2a_gpu_available());
+        check("publication hardware shader compilation", nv2a_gpu_compile());
+        test_gpu_depth_minimal();
+        test_gpu_scissor_coverage();
+        test_gpu_rejected_outputs();
+        test_gpu_publication_benchmark();
+        printf("nv2a_shader_publication: %s\n", failures ? "FAILED" : "ALL PASS");
+        return failures ? 1 : 0;
+    }
     if (getenv("NV2A_GPU_DEPTH_ONLY")) {
         _putenv_s("RECOMP_GPU_EXPERIMENTAL_DEPTH", "1");
         check("minimal D3D11 device", nv2a_gpu_available());
@@ -1148,6 +1294,7 @@ int main(int argument_count, char **arguments)
         test_gpu();
         test_gpu_depth_minimal();
         test_gpu_scissor_coverage();
+        test_gpu_rejected_outputs();
     }
     _putenv_s("RECOMP_FB_DUMP", "");
     _putenv_s("RECOMP_TEX_DUMP", "");

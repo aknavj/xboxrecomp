@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "../video/fb_present.h"
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
@@ -394,6 +395,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    xbox_FramebufferStatsReport();
     ExitProcess(BugCheckCode);
 }
 
@@ -412,6 +414,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    xbox_FramebufferStatsReport();
     ExitProcess(BugCheckCode);
 }
 
@@ -457,12 +460,14 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    xbox_FramebufferStatsReport();
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    xbox_FramebufferStatsReport();
     ExitProcess(0);
 }
 

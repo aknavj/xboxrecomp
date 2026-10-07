@@ -39,6 +39,12 @@
 #include "../d3d/nv2a_shader_cpu.h"
 #ifdef _WIN32
 #include "nv2a_gpu.h"
+static void flush_for_reason(Nv2aGpuSyncReason reason)
+{
+    nv2a_gpu_flush_reason(reason);
+}
+#else
+#define flush_for_reason(reason) nv2a_pb_exec_flush()
 #endif
 
 void nv2a_pb_exec_flush(void)
@@ -414,7 +420,7 @@ static void semaphore_release(uint32_t value)
     if (!destination)
         goto failure;
     /* Retire the command's value, not a concurrently advanced CPU counter. */
-    nv2a_pb_exec_flush();
+    flush_for_reason(NV2A_GPU_SYNC_SEMAPHORE);
     *(volatile uint32_t *)destination = value;
     return;
 
@@ -776,7 +782,7 @@ static void clear_surface(uint32_t param)
 #ifdef _WIN32
     native_clear = gpu_clear_surface(param);
 #endif
-    if (!native_clear) nv2a_pb_exec_flush();
+    if (!native_clear) flush_for_reason(NV2A_GPU_SYNC_CPU_CLEAR);
 
     if (!native_clear && (param & 3u) && s_gpu.depth_offset && s_gpu.depth_pitch) {
         uint32_t format = (s_gpu.format >> 4) & 15u;
@@ -1529,7 +1535,7 @@ static void raster_triangle(const float a[2], const float b[2],
     float fast_uv[3][2];
     uint8_t fast_modulate[4][256];
 
-    nv2a_pb_exec_flush();
+    flush_for_reason(NV2A_GPU_SYNC_CPU_RASTER);
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -3047,14 +3053,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (method == NV097_WAIT_FOR_IDLE) {
-        nv2a_pb_exec_flush();
+        flush_for_reason(NV2A_GPU_SYNC_IDLE);
         return;
     }
     if (method == 0x0100) {
         if (!param)
             return;
         if (xbox_Nv2aNativeFencesEnabled()) {
-            nv2a_pb_exec_flush();
+            flush_for_reason(NV2A_GPU_SYNC_NOTIFY);
             if (xbox_Nv2aSoftwareMethod(param, s_gpu.depth_clear,
                                        s_gpu.clear_color))
                 return;
@@ -3552,7 +3558,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
-        nv2a_pb_exec_flush();
+        flush_for_reason(NV2A_GPU_SYNC_FLIP);
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
@@ -3817,7 +3823,7 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
-    nv2a_pb_exec_flush();
+    flush_for_reason(NV2A_GPU_SYNC_REPORT);
     fprintf(stderr, "[GPU-D3D11] batches: %u hardware, %u CPU fallback\n", s_gpu.gpu_batches, s_gpu.cpu_batches);
     fprintf(stderr, "[GPU-D3D11] index stream: %llu u16, %llu u32, %llu array-run indices; %llu above 65535; %llu native u32 batches\n",
             (unsigned long long)s_gpu.array16_indices, (unsigned long long)s_gpu.array32_indices,

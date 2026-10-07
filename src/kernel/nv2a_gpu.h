@@ -10,8 +10,23 @@ extern "C" {
 
 int nv2a_gpu_available(void);
 int nv2a_gpu_compile(void);
+typedef enum Nv2aGpuSyncReason {
+	NV2A_GPU_SYNC_EXTERNAL,
+	NV2A_GPU_SYNC_IDLE,
+	NV2A_GPU_SYNC_NOTIFY,
+	NV2A_GPU_SYNC_SEMAPHORE,
+	NV2A_GPU_SYNC_FLIP,
+	NV2A_GPU_SYNC_CPU_CLEAR,
+	NV2A_GPU_SYNC_CPU_RASTER,
+	NV2A_GPU_SYNC_REPORT,
+	NV2A_GPU_SYNC_TARGET_CACHE,
+	NV2A_GPU_SYNC_TEXTURE_ALIAS,
+	NV2A_GPU_SYNC_INVALIDATE,
+	NV2A_GPU_SYNC_REASON_COUNT
+} Nv2aGpuSyncReason;
 void nv2a_gpu_sync(void);
 void nv2a_gpu_flush(void);
+void nv2a_gpu_flush_reason(Nv2aGpuSyncReason reason);
 void nv2a_gpu_invalidate(void);
 void nv2a_gpu_report(void);
 

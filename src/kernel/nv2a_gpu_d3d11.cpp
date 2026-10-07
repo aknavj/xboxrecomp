@@ -32,6 +32,7 @@ static struct {
     uint64_t color_created, depth_surface_created, color_refreshed, depth_refreshed;
     uint64_t color_refresh_reused, depth_refresh_reused;
     uint64_t color_readbacks, depth_readbacks, color_masked_draws, completion_waits;
+    uint64_t rejected_output_draws;
     uint64_t constant_uploads, constant_reuses;
     uint64_t color_copy_bytes, color_publish_bytes, depth_publish_bytes, depth_convert_bytes;
     uint64_t coverage_mask_updates, coverage_mask_rows;
@@ -65,6 +66,18 @@ struct GpuTimer {
 };
 
 static void report_gpu_samples();
+
+struct SyncReasonTiming {
+    uint64_t calls = 0, work = 0, color_readbacks = 0, depth_readbacks = 0;
+    uint64_t color_bytes = 0, depth_bytes = 0;
+    double seconds = 0;
+};
+static std::array<SyncReasonTiming, NV2A_GPU_SYNC_REASON_COUNT> sync_reasons;
+static const char *const sync_reason_names[] = {
+    "external", "idle", "notify", "semaphore", "flip", "cpu-clear", "cpu-raster",
+    "report", "target-cache", "texture-alias", "invalidate"
+};
+static_assert(sizeof sync_reason_names / sizeof *sync_reason_names == NV2A_GPU_SYNC_REASON_COUNT);
 
 extern "C" void nv2a_gpu_report(void)
 {
@@ -117,6 +130,17 @@ extern "C" void nv2a_gpu_report(void)
                  gpu_timing.sync_event_wait, (unsigned long long)gpu_timing.completion_waits,
                  (unsigned long long)gpu_timing.color_masked_draws, (unsigned long long)gpu_timing.color_readbacks,
                  (unsigned long long)gpu_timing.depth_readbacks);
+    std::fprintf(stderr, "[GPU-D3D11] output rejection: %llu draws cannot pass depth/stencil\n",
+                 (unsigned long long)gpu_timing.rejected_output_draws);
+    for (size_t index = 0; index < sync_reasons.size(); index++) {
+        const auto &reason = sync_reasons[index];
+        if (!reason.calls) continue;
+        std::fprintf(stderr, "[GPU-D3D11] sync reason %s: %llu calls, %llu with work, %.3fs; readbacks %llu color/%llu depth; published %.3f/%.3f GiB\n",
+                     sync_reason_names[index], (unsigned long long)reason.calls,
+                     (unsigned long long)reason.work, reason.seconds,
+                     (unsigned long long)reason.color_readbacks, (unsigned long long)reason.depth_readbacks,
+                     (double)reason.color_bytes / 1073741824.0, (double)reason.depth_bytes / 1073741824.0);
+    }
     std::fprintf(stderr, "[GPU-D3D11] constants: %llu uploads, %llu unchanged reuses, %.3fs\n",
                  (unsigned long long)gpu_timing.constant_uploads,
                  (unsigned long long)gpu_timing.constant_reuses, gpu_timing.constants);
@@ -1068,11 +1092,29 @@ static void publish_known_clear(SurfaceType &surface, uint32_t bytes)
     surface.dirty = false;
 }
 
-extern "C" void nv2a_gpu_sync(void)
+static void sync_for_reason(Nv2aGpuSyncReason reason)
 {
     GpuTimer sync_timer(gpu_timing.sync);
     if (!context) return;
+    auto &timing = sync_reasons[reason];
+    GpuTimer reason_timer(timing.seconds);
+    struct PublicationScope {
+        SyncReasonTiming &timing;
+        uint64_t color_readbacks = gpu_timing.color_readbacks, depth_readbacks = gpu_timing.depth_readbacks;
+        uint64_t color_bytes = gpu_timing.color_publish_bytes, depth_bytes = gpu_timing.depth_publish_bytes;
+        ~PublicationScope() {
+            timing.color_readbacks += gpu_timing.color_readbacks - color_readbacks;
+            timing.depth_readbacks += gpu_timing.depth_readbacks - depth_readbacks;
+            timing.color_bytes += gpu_timing.color_publish_bytes - color_bytes;
+            timing.depth_bytes += gpu_timing.depth_publish_bytes - depth_bytes;
+        }
+    } publication_scope{timing};
+    timing.calls++;
     gpu_timing.sync_calls++;
+    bool dirty = std::any_of(surfaces.begin(), surfaces.end(), [](const Surface &surface) { return surface.dirty; }) ||
+        std::any_of(depth_surfaces.begin(), depth_surfaces.end(), [](const DepthSurface &surface) { return surface.dirty; });
+    if (!pending_draws && !dirty) return;
+    timing.work++;
     ID3D11RenderTargetView *empty = nullptr;
     context->OMSetRenderTargets(1, &empty, nullptr);
     bool has_readback = false;
@@ -1244,16 +1286,31 @@ extern "C" void nv2a_gpu_sync(void)
     pending_draws = false;
 }
 
+extern "C" void nv2a_gpu_sync(void)
+{
+    sync_for_reason(NV2A_GPU_SYNC_EXTERNAL);
+}
+
 extern "C" void nv2a_gpu_flush(void)
 {
-    nv2a_gpu_sync();
+    nv2a_gpu_flush_reason(NV2A_GPU_SYNC_EXTERNAL);
+}
+
+extern "C" void nv2a_gpu_flush_reason(Nv2aGpuSyncReason reason)
+{
+    if (reason < NV2A_GPU_SYNC_EXTERNAL || reason >= NV2A_GPU_SYNC_REASON_COUNT) {
+        std::fprintf(stderr, "[GPU-D3D11] invalid synchronization reason: %d\n", (int)reason);
+        std::fflush(stderr);
+        std::_Exit(EXIT_FAILURE);
+    }
+    sync_for_reason(reason);
     for (auto &surface : surfaces) surface.needs_refresh = true;
     for (auto &surface : depth_surfaces) surface.needs_refresh = true;
 }
 
 extern "C" void nv2a_gpu_invalidate(void)
 {
-    nv2a_gpu_sync();
+    sync_for_reason(NV2A_GPU_SYNC_INVALIDATE);
     surfaces.clear();
     depth_surfaces.clear();
 }
@@ -1335,7 +1392,7 @@ static void prepare_target_cache(const Nv2aGpuDraw &state, TargetExtent extent =
     if (!layout_conflict &&
         !(new_color && surfaces.size() >= 64) && !(new_depth && depth_surfaces.size() >= 64)) return;
     if (layout_conflict) gpu_timing.target_layout_syncs++;
-    nv2a_gpu_sync();
+    sync_for_reason(NV2A_GPU_SYNC_TARGET_CACHE);
     size_t old_count = surfaces.size() + depth_surfaces.size();
     if (new_color && surfaces.size() >= 64) {
         auto oldest = std::min_element(surfaces.begin(), surfaces.end(),
@@ -1577,7 +1634,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         } else gpu_timing.alias_copy_reuses++;
     } else if (dirty_alias) {
         gpu_timing.texture_alias_syncs++;
-        nv2a_gpu_sync();
+        sync_for_reason(NV2A_GPU_SYNC_TEXTURE_ALIAS);
     }
     if (direct) {
         direct->last_used = ++surface_use_serial;
@@ -2423,11 +2480,18 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         if (texture_matrix_used) gpu_timing.texture_matrix_draws++;
     }
     pending_draws = true;
-    if (state->color_mask & 0x01010101u) { if (writes) mark_written_region(*surface, region); }
+    bool stencil_pass = !state->stencil_enable || state->stencil_function != 0x200;
+    bool depth_pass = !state->depth_enable || state->depth_function != 0x200;
+    bool output_pass = stencil_pass && depth_pass;
+    if (!output_pass) gpu_timing.rejected_output_draws++;
+    if (state->color_mask & 0x01010101u) { if (writes && output_pass) mark_written_region(*surface, region); }
     else gpu_timing.color_masked_draws++;
     bool stencil_writes = state->stencil_enable && (state->stencil_write_mask & 255u) &&
-        (state->stencil_fail != 0x1E00 || state->stencil_depth_fail != 0x1E00 || state->stencil_pass != 0x1E00);
-    if (depth && ((state->depth_enable && state->depth_mask) || stencil_writes) && writes) mark_written_region(*depth, region);
+        ((state->stencil_function != 0x207 && state->stencil_fail != 0x1E00) ||
+         (stencil_pass && state->depth_enable && state->depth_function != 0x207 && state->stencil_depth_fail != 0x1E00) ||
+         (output_pass && state->stencil_pass != 0x1E00));
+    if (depth && ((state->depth_enable && state->depth_mask && output_pass) || stencil_writes) && writes)
+        mark_written_region(*depth, region);
     ID3D11ShaderResourceView *empty[12] = {};
     context->PSSetShaderResources(0, 12, empty);
     return 1;

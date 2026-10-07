@@ -117,6 +117,15 @@ The non-Windows CPU path remains separate. CPU-side command decoding,
 topology conversion and texture-format decoding still occur; "zero CPU
 fallback" describes rasterization, not the absence of CPU work.
 
+The periodic `sync reason` lines attribute calls, calls with pending work,
+elapsed time, staging readbacks and published color/depth bytes to idle waits,
+software notifications, semaphores, flips, CPU clears/rasterization, reporting,
+target-cache conflicts, texture aliases, invalidation and external callers.
+Counters are cumulative; compare successive report deltas in the same scene.
+No command-level tracing is required. A synchronization with neither pending
+draws nor dirty targets avoids rebinding the output merger; a flush still marks
+retained targets for CPU-memory comparison before reuse.
+
 ## Command Processing and Geometry
 
 The scanner retains incomplete method packets across consecutive submissions.
@@ -596,6 +605,16 @@ other uniforms still trigger `WRITE_DISCARD`; native rectangle clears use a
 separate buffer. Recreating the draw buffer invalidates its snapshot.
 The `constants` report separates uploads from unchanged reuses.
 
+Output dirtiness also follows depth/stencil operation reachability. `NEVER`
+depth or stencil comparison cannot create color/depth writes; stencil fail,
+depth-fail and pass operations are considered only on reachable paths.
+Already-dirty outputs from earlier draws are retained. Rejected-output draws
+still execute on D3D11 and participate in completion waits, including when
+only stencil writes are reachable. This avoids stale publication over CPU
+changes as well as unnecessary downloads. The `output rejection` counter
+counts draws that cannot pass depth/stencil; it is not a count of avoided
+readbacks, since stencil writes or earlier dirty draws may still require them.
+
 The cumulative `executor time` report uses a monotonic high-resolution clock
 to separate native vertex/state preparation from backend calls. `draw phases`
 partitions backend time into setup, texture processing, stream/constant uploads,
@@ -697,6 +716,41 @@ shader variants. It does not compile every generated guest vertex/state
 program or pixel specialization. Shader compilation and successful draw
 submission are not substitutes for runtime and visual validation.
 
+The existing hardware smoke executable has a focused publication mode:
+
+```powershell
+cmake --build .\build-xr --config Release --target nv2a_shader_smoke --parallel 2
+$env:NV2A_GPU_PUBLICATION_ONLY = "1"
+.\build-xr\src\d3d\d3d8_smoke\Release\nv2a_shader_smoke.exe
+Remove-Item Env:\NV2A_GPU_PUBLICATION_ONLY
+```
+
+It verifies D16/D24S8 packing, CPU mutations, retained dirty writes, reachable
+and unreachable stencil operations, disjoint scissors and row padding. It
+also measures 256 synchronized draws per 640x480 pitched D16/D24S8 workload
+and a `NEVER`-depth workload. Reports before and after the latter distinguish
+completion time from readback obligations. The renderer must use hardware;
+the mode does not select WARP, capture frames or automate title input.
+These synthetic timings are not gameplay-FPS measurements.
+
+### October 2026 Performance Investigation
+
+A 90-second Release title run's last periodic snapshot attributed 18.391
+seconds to semaphore releases and 2.535 seconds to idle waits. Semaphores
+accounted for about 88% of attributed synchronization time, 12,207 color and
+8,186 depth readbacks; notifications and flips had no pending work. It reported
+325,998 hardware batches and zero CPU rasterization fallback. This is one
+workload, not proof that those proportions hold for every scene.
+
+The rejected-output regression workload added 256 completion waits and zero
+color/depth readbacks, with exact publication checks passing. The title run
+did not exercise that rejection path, so it establishes no title-FPS gain.
+Separate depth upload/download staging and a single batched readback event
+wait were also compared; neither showed a reliable improvement, and neither
+runtime experiment was retained. The larger unresolved optimization is
+CPU-access coherence for GPU-resident targets, not bypassing semaphores or
+publishing their values before rendering completes.
+
 Verify that the game's CMake configuration includes the intended generated
 sources and that the executable matches the configuration being tested.
 Compare displayed frames with reference output using equivalent guest state.
@@ -719,6 +773,19 @@ high-resolution clock and an atomic counter of completed presentation calls.
 GDI repaints do not increase the frame count or FPS; pinned framebuffer mode
 still counts game presentation calls. Title updates do not run on the GPU
 submission thread or alter input handling.
+Each statistics update also logs the same caption to stderr with the
+`[FBWIN]` prefix, including `0.00 FPS` when presentation stops. Ghost redirects
+these lines to `Ghost-errors.log` beside its executable. Logging is once per
+second, not once per frame, and uses the exact FPS/frame sample shown in the
+window title.
+At normal process exit, window close, guest HAL shutdown/bug check or watchdog
+termination, the presenter logs one
+`[FBWIN] Average <fps> FPS | Frame <count> | Elapsed <seconds> seconds` summary.
+The average is total game presentations divided by wall time since the
+framebuffer presenter started, including loading, video and stalled periods;
+it is not an arithmetic mean of rounded per-second samples. Duplicate shutdown
+notifications do not emit duplicate summaries. Forced external termination
+or an abrupt crash may prevent the report.
 
 Set a capture destination before launching the game:
 

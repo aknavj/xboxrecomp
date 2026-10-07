@@ -15,6 +15,7 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include "fb_present.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -43,6 +44,30 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
+static LARGE_INTEGER s_stats_frequency, s_stats_start;
+static LONG64 s_stats_initial_frame;
+static volatile LONG s_stats_ready, s_stats_reported;
+
+void xbox_FramebufferStatsReport(void)
+{
+    LARGE_INTEGER now;
+    LONG64 frame;
+    double elapsed, fps;
+    if (!InterlockedCompareExchange(&s_stats_ready, 0, 0) ||
+        InterlockedCompareExchange(&s_stats_reported, 1, 0))
+        return;
+    if (!QueryPerformanceCounter(&now) || now.QuadPart <= s_stats_start.QuadPart) {
+        fprintf(stderr, "[FBWIN] average FPS unavailable: cannot query elapsed presentation time\n");
+        fflush(stderr);
+        return;
+    }
+    frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+    elapsed = (double)(now.QuadPart - s_stats_start.QuadPart) / s_stats_frequency.QuadPart;
+    fps = (double)(frame - s_stats_initial_frame) / elapsed;
+    fprintf(stderr, "[FBWIN] Average %.2f FPS | Frame %llu | Elapsed %.3f seconds\n",
+            fps, (unsigned long long)frame, elapsed);
+    fflush(stderr);
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -125,6 +150,7 @@ static void fb_exit_process(void)
 {
     InterlockedExchange(&s_fb_running, 0);
     fprintf(stderr, "[FBWIN] close requested; exiting process\n");
+    xbox_FramebufferStatsReport();
     fflush(stderr);
     ExitProcess(EXIT_SUCCESS);
 }
@@ -417,9 +443,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 LONG64 frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
                 double elapsed = (double)(now.QuadPart - title_clock.QuadPart) / title_frequency.QuadPart;
                 double fps = (double)(frame - title_frame) / elapsed;
-                if (fb_format_window_title(caption, caption_capacity, game_title, fps, frame))
+                if (fb_format_window_title(caption, caption_capacity, game_title, fps, frame)) {
                     fb_set_window_title(hwnd, caption);
-                else {
+                    fprintf(stderr, "  [FBWIN] %s\n", caption);
+                } else {
                     title_stats = 0;
                     fb_set_window_title(hwnd, game_title);
                 }
@@ -465,6 +492,17 @@ void xbox_FramebufferWindowStart(void)
 
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
+    if (!InterlockedCompareExchange(&s_stats_ready, 0, 0)) {
+        if (!QueryPerformanceFrequency(&s_stats_frequency) || s_stats_frequency.QuadPart <= 0 ||
+            !QueryPerformanceCounter(&s_stats_start))
+            fprintf(stderr, "[FBWIN] average FPS unavailable: cannot query performance clock\n");
+        else {
+            s_stats_initial_frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+            InterlockedExchange(&s_stats_ready, 1);
+            if (atexit(xbox_FramebufferStatsReport) != 0)
+                fprintf(stderr, "[FBWIN] cannot register average FPS shutdown report\n");
+        }
+    }
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
     if (th)
         CloseHandle(th);
@@ -473,6 +511,7 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
+void xbox_FramebufferStatsReport(void) {}
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
