@@ -7,6 +7,7 @@
 
 add_library(xbox_apu STATIC
     apu_core.c
+    apu_dma.c
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c

@@ -22,6 +22,7 @@
 #pragma once
 
 #include "apu_shim.h"
+#include "apu.h"
 #include "apu_regs.h"
 #include "apu_debug.h"
 
@@ -414,6 +415,19 @@ typedef struct VoiceWorkDispatch {
     int queue_len;
 } VoiceWorkDispatch;
 
+typedef struct MCPXAPUDmaBinding {
+    uint64_t physical;
+    uint8_t *storage;
+    uint32_t available;
+} MCPXAPUDmaBinding;
+
+typedef struct MCPXAPUDmaTable {
+    MCPXAPUDmaBinding base;
+    MCPXAPUDmaBinding *entries;
+    uint32_t capacity;
+    bool page_aligned;
+} MCPXAPUDmaTable;
+
 typedef struct MCPXAPUVPState {
     MemoryRegion mmio;
     VoiceWorkDispatch voice_work_dispatch;
@@ -426,6 +440,11 @@ typedef struct MCPXAPUVPState {
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
+    uint64_t voice_relinks;
+    uint64_t voice_list_errors;
+    uint64_t frontend_trapped_ticks;
+    uint64_t frontend_halted_ticks;
+    uint64_t inactive_ticks;
 
     struct {
         int current_entry;
@@ -437,6 +456,8 @@ typedef struct MCPXAPUVPState {
 
     uint32_t inbuf_sge_handle;
     uint32_t outbuf_sge_handle;
+    MCPXAPUDmaBinding voice_table, notify_table;
+    MCPXAPUDmaTable sge_table, ssl_table;
 } MCPXAPUVPState;
 
 /* ============================================================
@@ -448,6 +469,7 @@ typedef struct MCPXAPUGPState {
     MemoryRegion mmio;
     DSPState *dsp;
     uint32_t regs[0x10000];
+    MCPXAPUDmaTable scratch_table;
 } MCPXAPUGPState;
 
 typedef struct MCPXAPUEPState {
@@ -455,6 +477,7 @@ typedef struct MCPXAPUEPState {
     MemoryRegion mmio;
     DSPState *dsp;
     uint32_t regs[0x10000];
+    MCPXAPUDmaTable scratch_table;
 } MCPXAPUEPState;
 
 /* ============================================================
@@ -478,6 +501,9 @@ struct MCPXAPUState {
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
+    APUPhysicalMemoryMapper physical_mapper;
+    uint32_t ram_size;
+    MCPXAPUDmaBinding frontend_memory, absolute_ack[8];
     MemoryRegion mmio;
 
     MCPXAPUVPState vp;
@@ -519,6 +545,24 @@ struct MCPXAPUState {
  * ============================================================ */
 
 /* VP functions */
+uint8_t *mcpx_apu_dma_table_pointer(MCPXAPUState *d, MCPXAPUDmaBinding *binding,
+                                  uint64_t physical, uint64_t offset, uint32_t bytes);
+uint8_t *mcpx_apu_dma_pointer(const MCPXAPUDmaBinding *binding,
+                            uint64_t offset, uint32_t bytes);
+MCPXAPUDmaBinding *mcpx_apu_dma_entry(MCPXAPUState *d, MCPXAPUDmaTable *table,
+                                    uint64_t physical, uint32_t entry);
+uint8_t *mcpx_apu_dma_descriptor(MCPXAPUState *d, MCPXAPUDmaTable *table,
+                                uint64_t physical, uint32_t entry);
+void mcpx_apu_dma_program_entry(MCPXAPUState *d, MCPXAPUDmaTable *table,
+                               uint64_t physical, uint32_t entry, uint32_t payload);
+MCPXAPUDmaBinding mcpx_apu_dma_sge_address(MCPXAPUState *d, MCPXAPUDmaTable *table,
+                                        uint64_t physical, uint64_t linear);
+void mcpx_apu_dma_sge_read(MCPXAPUState *d, MCPXAPUDmaTable *table,
+                         uint64_t physical, uint64_t linear, void *output, uint32_t bytes);
+void mcpx_apu_dma_register_write(MCPXAPUState *d, hwaddr reg);
+void mcpx_apu_dma_reset_table(MCPXAPUDmaTable *table);
+void mcpx_apu_dma_free_table(MCPXAPUDmaTable *table);
+
 void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
@@ -526,9 +570,12 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
+void mcpx_apu_dsp_finalize(MCPXAPUState *d);
 void mcpx_apu_dsp_ack_frame(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+/* Caller holds d->lock, as in the frame thread. */
+void mcpx_apu_frame_tick(MCPXAPUState *d);
 
 /* Debug globals */
 extern MCPXAPUState *g_state;

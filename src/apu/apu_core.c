@@ -33,20 +33,21 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
-static APUPhysicalMemoryMapper g_apu_physical_mapper;
 
 bool mcpx_apu_diagnostics_enabled(void)
 {
     static int enabled = -1;
-    if (enabled < 0)
-        enabled = getenv("RECOMP_APU_DIAG") != NULL;
+    if (enabled < 0) {
+        const char *setting = getenv("RECOMP_APU_DIAG");
+        enabled = setting && strcmp(setting, "0") != 0;
+    }
     return enabled != 0;
 }
 
 uint8_t *mcpx_apu_ram_address(uint64_t physical, uint32_t bytes)
 {
-    if (g_apu_physical_mapper) {
-        uint8_t *pointer = g_apu_physical_mapper(physical, bytes);
+    if (g_state && g_state->physical_mapper) {
+        uint8_t *pointer = g_state->physical_mapper(physical, bytes);
         if (pointer) return pointer;
         fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
                 (unsigned long long)physical, bytes);
@@ -153,6 +154,16 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     (void)size;
 
     switch (addr) {
+    case NV_PAPU_VPVADDR:
+    case NV_PAPU_FENADDR:
+    case NV_PAPU_FEMEMADDR:
+    case NV_PAPU_VPSGEADDR:
+    case NV_PAPU_VPSSLADDR:
+    case NV_PAPU_GPSADDR:
+    case NV_PAPU_EPSADDR:
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        mcpx_apu_dma_register_write(d, addr);
+        break;
     case NV_PAPU_ISTS:
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
@@ -196,7 +207,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FEMEMDATA:
         /* 'magic write' - value written to FEMEMADDR on notify completion */
-        stl_le_phys(address_space_memory, d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
+        stl_le_p(mcpx_apu_dma_table_pointer(d, &d->frontend_memory,
+                 d->regs[NV_PAPU_FEMEMADDR], 0, 4), (uint32_t)val);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         break;
     default:
@@ -423,8 +435,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             if (amplitude > g_audio_output.peak) g_audio_output.peak = amplitude;
         }
     }
-    static int diagnostic = -1;
-    if (diagnostic < 0) diagnostic = getenv("RECOMP_APU_DIAG") != NULL;
+    bool diagnostic = mcpx_apu_diagnostics_enabled();
     unsigned long now = (unsigned long)GetTickCount();
     if (diagnostic && now - g_audio_output.last_report >= 1000) {
         g_audio_output.last_report = now;
@@ -439,7 +450,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         fprintf(stderr, "[APU-OUT] %s blocks=%llu frames=%llu nonzero=%llu "
                         "hardware_nonzero=%llu peak=%d tone=%d muted=%d sectl=%08X fectl=%08X "
-                        "voices=%d paused=%d pitched=%d lists=%04X/%04X/%04X\n",
+                        "voices=%d paused=%d pitched=%d lists=%04X/%04X/%04X "
+                        "relinks=%llu list_errors=%llu fe_trap_ticks=%llu "
+                        "fe_halt_ticks=%llu inactive_ticks=%llu\n",
                 xa2_is_active() ? "XAudio2" : "waveOut",
                 (unsigned long long)g_audio_output.blocks,
                 (unsigned long long)g_audio_output.frames,
@@ -447,7 +460,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 (unsigned long long)g_audio_output.hardware_nonzero,
                 g_audio_output.peak, g_test_tone.active, g_audio_muted, sectl, fectl,
                 active, paused, pitched, d->regs[NV_PAPU_TVL2D],
-                d->regs[NV_PAPU_TVL3D], d->regs[NV_PAPU_TVLMP]);
+                d->regs[NV_PAPU_TVL3D], d->regs[NV_PAPU_TVLMP],
+                (unsigned long long)d->vp.voice_relinks,
+                (unsigned long long)d->vp.voice_list_errors,
+                (unsigned long long)d->vp.frontend_trapped_ticks,
+                (unsigned long long)d->vp.frontend_halted_ticks,
+                (unsigned long long)d->vp.inactive_ticks);
         fprintf(stderr, "[APU-DSP] passthrough peak=%.5f clipped=%llu nonfinite=%llu\n",
                 g_dbg.ep.mix_peak_since_report,
                 (unsigned long long)g_dbg.ep.clipped_since_report,
@@ -457,15 +475,26 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
             struct McpxApuDebugVoice *voice = &g_dbg.vp.v[v];
             if (voice->source_peak_since_report > 0.0f ||
-                voice->mixed_peak_since_report > 0.0f) {
+                voice->mixed_peak_since_report > 0.0f ||
+                voice->format_mismatches_since_report != 0 ||
+                voice->adpcm_bad_headers_since_report != 0) {
                 fprintf(stderr, "[APU-ROUTE] id=%u class=%s multipass=%d "
+                                "fmt=%08X ba=%08X source_phys=%08llX source_ram=%p "
+                                "ssl_fmt=%08X ssl_format_mismatches=%llu "
+                                "adpcm_hash=%08X adpcm_bytes=%u adpcm_bad_headers=%llu "
                                 "source_peak=%.5f mixed_peak=%.5f "
                                 "filtered_peak=%.5f rate=%.5f..%.5f "
                                 "filter=%u coeff=%08X/%08X filter_clipped=%llu filter_nonfinite=%llu "
                                 "bins=%u/%u/%u/%u/%u/%u/%u/%u "
                                 "vol=%03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X\n",
                         (unsigned)v, v < MCPX_HW_MAX_3D_VOICES ? "3D" : "2D",
-                        voice->multipass, voice->source_peak_since_report,
+                        voice->multipass, voice->format, voice->ba,
+                        (unsigned long long)voice->source_physical, voice->source_storage,
+                        voice->ssl_segment_format,
+                        (unsigned long long)voice->format_mismatches_since_report,
+                        voice->adpcm_block_hash, voice->adpcm_block_bytes,
+                        (unsigned long long)voice->adpcm_bad_headers_since_report,
+                        voice->source_peak_since_report,
                         voice->mixed_peak_since_report,
                         voice->filtered_peak_since_report,
                         voice->min_rate_since_report, voice->max_rate_since_report,
@@ -484,6 +513,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             voice->min_rate_since_report = voice->max_rate_since_report = 0.0f;
             voice->filter_clipped_since_report = 0;
             voice->filter_nonfinite_since_report = 0;
+            voice->format_mismatches_since_report = 0;
+            voice->adpcm_bad_headers_since_report = 0;
         }
         int reported = 0;
         for (int v = 0; v < MCPX_HW_MAX_VOICES && reported < 8; v++) {
@@ -578,6 +609,34 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+void mcpx_apu_frame_tick(MCPXAPUState *d)
+{
+    mcpx_apu_dsp_ack_frame(d);
+
+    /* A temporary FE trap must not erase preceding slices in this packet. */
+    unsigned int offset = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    memset(&d->monitor.frame_buf[offset], 0,
+           NUM_SAMPLES_PER_FRAME * sizeof(d->monitor.frame_buf[0]));
+
+    int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                            NV_PAPU_SECTL_XCNTMODE);
+    uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+    uint32_t mode = fectl & NV_PAPU_FECTL_FEMETHMODE;
+    bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                      mode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
+                      mode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
+
+    if (apu_active && !g_test_tone.active) {
+        se_frame(d);
+    } else {
+        d->vp.inactive_ticks++;
+        d->vp.frontend_trapped_ticks += mode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+        d->vp.frontend_halted_ticks += mode == NV_PAPU_FECTL_FEMETHMODE_HALTED;
+        mcpx_apu_monitor_frame(d);
+        qatomic_fetch_add(&d->ep_frame_div, 1);
+    }
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -608,26 +667,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
-        /* DSP command servicing is independent of the voice front end. */
-        mcpx_apu_dsp_ack_frame(d);
-
-        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                                NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        uint32_t mode = fectl & NV_PAPU_FECTL_FEMETHMODE;
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          mode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
-                          mode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
-
-        if (apu_active && !g_test_tone.active) {
-            /* Full pipeline: VP voices → DSP → monitor → waveOut */
-            se_frame(d);
-        } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-            mcpx_apu_monitor_frame(d);
-            qatomic_fetch_add(&d->ep_frame_div, 1);
-        }
+        mcpx_apu_frame_tick(d);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -698,9 +738,10 @@ MCPXAPUState *mcpx_apu_init_standalone_mapped(
     }
 
     g_apu_ram_ptr = ram_ptr;
-    g_apu_physical_mapper = mapper;
+    d->physical_mapper = mapper;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    d->ram_size = 64 * 1024 * 1024;
 
     d->set_irq = false;
     d->exiting = false;
@@ -756,6 +797,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 
     qemu_thread_join(&d->apu_thread);
     mcpx_apu_vp_finalize(d);
+    mcpx_apu_dsp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 
     free(d);
@@ -792,7 +834,19 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+    else if (is_write &&
+             ((addr >= 0x30000 && addr < 0x40000) ||
+              (addr >= 0x50000 && addr < 0x60000))) {
+        bool gp = addr < 0x40000;
+        uint32_t local = (uint32_t)(addr & 0xFFFF);
+        qemu_mutex_lock(&d->lock);
+        (gp ? d->gp.regs : d->ep.regs)[local] = (uint32_t)val;
+        if (local == NV_PAPU_GPRST) {
+            mcpx_apu_dma_reset_table(gp ? &d->gp.scratch_table : &d->ep.scratch_table);
+        }
+        qemu_mutex_unlock(&d->lock);
+    }
+    /* GP/EP execution and register read semantics remain stubbed. */
 }
 
 /* ============================================================

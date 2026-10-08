@@ -49,13 +49,13 @@ static const struct {
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
-    hwaddr notify_offset = d->regs[NV_PAPU_FENADDR];
-    notify_offset += 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
+    uint64_t notify_offset = 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
                            v * MCPX_HW_NOTIFIER_COUNT + notifier);
     notify_offset += 15;
-
-    stb_phys(address_space_memory, notify_offset, (uint8_t)status);
-    stb_phys(address_space_memory, notify_offset - 1, 1);
+    uint8_t *notification = mcpx_apu_dma_table_pointer(
+        d, &d->vp.notify_table, d->regs[NV_PAPU_FENADDR], notify_offset - 1, 2);
+    notification[1] = (uint8_t)status;
+    notification[0] = 1;
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -81,6 +81,11 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     voice_reset_resampler(&d->vp.filters[v]);
     g_dbg.vp.v[v].starved_reads = 0;
+    g_dbg.vp.v[v].source_physical = 0;
+    g_dbg.vp.v[v].source_storage = NULL;
+    g_dbg.vp.v[v].adpcm_block_hash = 0;
+    g_dbg.vp.v[v].adpcm_block_bytes = 0;
+    g_dbg.vp.v[v].ssl_segment_format = 0;
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
@@ -116,23 +121,72 @@ static float attenuate(uint16_t vol)
 static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
                                hwaddr offset, uint32_t mask)
 {
-    hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    return (ldl_le_phys(address_space_memory, voice + offset) & mask) >>
+    uint8_t *word = mcpx_apu_dma_table_pointer(d, &d->vp.voice_table,
+        d->regs[NV_PAPU_VPVADDR], (uint64_t)voice_handle * NV_PAVS_SIZE + offset, 4);
+    return (ldl_le_p(word) & mask) >>
            ctz32(mask);
 }
 
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
-    hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(address_space_memory, voice + offset) & ~mask;
-    stl_le_phys(address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    uint8_t *word = mcpx_apu_dma_table_pointer(d, &d->vp.voice_table,
+        d->regs[NV_PAPU_VPVADDR], (uint64_t)voice_handle * NV_PAVS_SIZE + offset, 4);
+    uint32_t v = ldl_le_p(word) & ~mask;
+    stl_le_p(word, v | ((val << ctz32(mask)) & mask));
 }
 
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
+
+static void voice_list_error(MCPXAPUState *d, const char *reason,
+                             unsigned int list, uint32_t voice)
+{
+    uint64_t count = ++d->vp.voice_list_errors;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        fprintf(stderr, "[APU-LIST] %s list=%u voice=%u errors=%llu\n",
+                reason, list, voice, (unsigned long long)count);
+    }
+}
+
+static bool voice_find_and_unlink(MCPXAPUState *d, uint16_t voice, bool unlink)
+{
+    bool found = false;
+    for (unsigned int list = 0; list < ARRAY_SIZE(voice_list_regs); list++) {
+        bool seen[MCPX_HW_MAX_VOICES] = {false};
+        uint16_t previous = 0xFFFF;
+        uint32_t current = d->regs[voice_list_regs[list].top];
+        while (current != 0xFFFF) {
+            if (current >= MCPX_HW_MAX_VOICES || seen[current]) {
+                voice_list_error(d, "invalid or cyclic chain during voice reuse", list, current);
+                break;
+            }
+            seen[current] = true;
+            uint32_t next = voice_get_mask(d, (uint16_t)current,
+                NV_PAVS_VOICE_TAR_PITCH_LINK,
+                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            if (current == voice) {
+                if (!unlink) return true;
+                if (next == voice) {
+                    voice_list_error(d, "removing reused self-linked voice", list, current);
+                    next = 0xFFFF;
+                }
+                if (previous == 0xFFFF) {
+                    d->regs[voice_list_regs[list].top] = next;
+                } else {
+                    voice_set_mask(d, previous, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE, next);
+                }
+                found = true;
+                break;
+            }
+            previous = (uint16_t)current;
+            current = next;
+        }
+    }
+    return found;
+}
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
@@ -207,23 +261,38 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
+        unsigned int antecedent_voice =
+            GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
+        bool inherit = list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT;
+        if (selected_handle >= MCPX_HW_MAX_VOICES ||
+            (inherit && antecedent_voice >= MCPX_HW_MAX_VOICES)) {
+            voice_list_error(d, "invalid VOICE_ON handle or antecedent", list, selected_handle);
+            break;
+        }
+        bool keep_position = inherit && antecedent_voice == selected_handle;
+        if (keep_position &&
+            !voice_find_and_unlink(d, (uint16_t)selected_handle, false)) {
+            voice_list_error(d, "unlinked VOICE_ON self antecedent", list, selected_handle);
+            break;
+        }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
 
-        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
-        if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
+        /* VOICE_OFF leaves membership for guest idle handling; reuse must detach it. */
+        if (!keep_position &&
+            voice_find_and_unlink(d, (uint16_t)selected_handle, true)) {
+            d->vp.voice_relinks++;
+        }
+        if (!inherit) {
             unsigned int top_reg = voice_list_regs[list - 1].top;
             voice_set_mask(d, (uint16_t)selected_handle,
                            NV_PAVS_VOICE_TAR_PITCH_LINK,
                            NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
                            d->regs[top_reg]);
             d->regs[top_reg] = selected_handle;
-        } else {
-            unsigned int antecedent_voice =
-                GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
-            assert(antecedent_voice != 0xFFFF);
-
+        } else if (!keep_position) {
             uint32_t next_handle = voice_get_mask(
                 d, (uint16_t)antecedent_voice, NV_PAVS_VOICE_TAR_PITCH_LINK,
                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
@@ -452,10 +521,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET: {
-        hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.inbuf_sge_handle * 8;
-        stl_le_phys(address_space_memory, sge_address,
-                    argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
+        mcpx_apu_dma_program_entry(d, &d->vp.sge_table, d->regs[NV_PAPU_VPSGEADDR],
+            d->vp.inbuf_sge_handle,
+            argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
         break;
     }
 
@@ -465,10 +533,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET: {
-        hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
-        stl_le_phys(address_space_memory, sge_address,
-                    argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
+        mcpx_apu_dma_program_entry(d, &d->vp.sge_table, d->regs[NV_PAPU_VPSGEADDR],
+            d->vp.outbuf_sge_handle,
+            argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;
     }
 
@@ -546,10 +613,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         } else if (method >= NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET &&
                    method < NV1BA0_PIO_SET_SSL_SEGMENT_LENGTH + 8 * 64) {
             assert((method & 0x3) == 0);
-            hwaddr addr = d->regs[NV_PAPU_VPSSLADDR]
-                          + (d->vp.ssl_base_page * 8)
-                          + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
-            stl_le_phys(address_space_memory, addr, argument);
+            uint32_t relative = (uint32_t)(method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
+            uint32_t entry = d->vp.ssl_base_page + relative / NV_PSGE_SIZE;
+            if (relative % NV_PSGE_SIZE == 0) {
+                mcpx_apu_dma_program_entry(d, &d->vp.ssl_table,
+                    d->regs[NV_PAPU_VPSSLADDR], entry, argument);
+            } else {
+                uint8_t *descriptor = mcpx_apu_dma_descriptor(d, &d->vp.ssl_table,
+                    d->regs[NV_PAPU_VPSSLADDR], entry);
+                stl_le_p(descriptor + 4, argument);
+            }
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
@@ -599,15 +672,6 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
 /* ============================================================
  * SGE data pointer resolution
  * ============================================================ */
-
-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
-{
-    unsigned int entry = addr / TARGET_PAGE_SIZE;
-    assert(entry <= max_sge);
-    uint32_t prd_address =
-        ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
-    return prd_address + addr % TARGET_PAGE_SIZE;
-}
 
 /* ============================================================
  * Envelope processing
@@ -752,6 +816,30 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * Sample fetching from voice buffers
  * ============================================================ */
 
+static void voice_record_source(uint32_t v, hwaddr physical, void *storage)
+{
+    if (!mcpx_apu_diagnostics_enabled()) return;
+    g_dbg.vp.v[v].source_physical = physical;
+    g_dbg.vp.v[v].source_storage = storage;
+    g_dbg.vp.v[v].adpcm_block_hash = 0;
+    g_dbg.vp.v[v].adpcm_block_bytes = 0;
+}
+
+static void voice_record_adpcm_block(uint32_t v, const uint8_t *block,
+                                     uint32_t bytes, unsigned int channels)
+{
+    if (!mcpx_apu_diagnostics_enabled()) return;
+    struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
+    uint32_t hash = UINT32_C(2166136261);
+    for (uint32_t i = 0; i < bytes; i++)
+        hash = (hash ^ block[i]) * UINT32_C(16777619);
+    dbg->adpcm_block_hash = hash;
+    dbg->adpcm_block_bytes = bytes;
+    for (unsigned int channel = 0; channel < channels; channel++)
+        if (block[channel * 4 + 2] > 88)
+            dbg->adpcm_bad_headers_since_report++;
+}
+
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
@@ -795,6 +883,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     int ssl_index = 0, ssl_seg = 0, page = 0, count = 0;
     int seg_len = 0, seg_cs = 0, seg_spb = 0, seg_s = 0;
     hwaddr segment_offset = 0;
+    MCPXAPUDmaBinding *stream_source = NULL;
     uint32_t segment_length = 0;
     size_t block_size;
 
@@ -839,15 +928,23 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             return -1;
         }
 
-        hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
-        segment_offset = ldl_le_phys(address_space_memory, addr);
-        segment_length = ldl_le_phys(address_space_memory, addr + 4);
+        stream_source = mcpx_apu_dma_entry(d, &d->vp.ssl_table,
+                                          d->regs[NV_PAPU_VPSSLADDR], (uint32_t)page);
+        segment_offset = stream_source->physical;
+        segment_length = ldl_le_p(mcpx_apu_dma_table_pointer(d, &d->vp.ssl_table.base,
+            d->regs[NV_PAPU_VPSSLADDR], (uint64_t)page * NV_PSGE_SIZE + 4, 4));
+        if (mcpx_apu_diagnostics_enabled()) dbg->ssl_segment_format = segment_length;
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
         seg_s = (segment_length >> 23) & 1;
+        if (mcpx_apu_diagnostics_enabled() &&
+            (seg_cs != (int)container_size_index ||
+             seg_spb + 1 != (int)samples_per_block || seg_s != (int)stereo)) {
+            dbg->format_mismatches_since_report++;
+        }
         container_size_index = seg_cs;
         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
@@ -873,22 +970,23 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             unsigned int block_index = cbo / ADPCM_SAMPLES_PER_BLOCK;
             unsigned int block_position = cbo % ADPCM_SAMPLES_PER_BLOCK;
             if (adpcm_block_index != (int)block_index) {
-                uint32_t linear_addr = block_index * (uint32_t)block_size;
+                uint64_t linear_addr = (uint64_t)block_index * block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_ram_address(addr, (uint32_t)block_size),
-                           block_size);
+                    uint8_t *storage = mcpx_apu_dma_pointer(
+                        stream_source, linear_addr, (uint32_t)block_size);
+                    voice_record_source(v, addr, storage);
+                    memcpy(adpcm_block, storage, block_size);
                 } else {
                     linear_addr += ba;
-                    for (unsigned int word_index = 0;
-                         word_index < (9 * samples_per_block); word_index++) {
-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
-                                                   0xFFFFFFFF, linear_addr);
-                        adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
-                        linear_addr += 4;
-                    }
+                    MCPXAPUDmaBinding source = mcpx_apu_dma_sge_address(
+                        d, &d->vp.sge_table, d->regs[NV_PAPU_VPSGEADDR], linear_addr);
+                    voice_record_source(v, source.physical, source.storage);
+                    mcpx_apu_dma_sge_read(d, &d->vp.sge_table,
+                        d->regs[NV_PAPU_VPSGEADDR], linear_addr, adpcm_block, (uint32_t)block_size);
                 }
+                voice_record_adpcm_block(v, (const uint8_t *)adpcm_block,
+                                         (uint32_t)block_size, channels);
                 adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,
                                    block_size, channels);
                 adpcm_block_index = block_index;
@@ -901,33 +999,43 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     adpcm_decoded[block_position * channels + 1]);
             }
         } else {
-            hwaddr addr;
-            if (stream) {
-                addr = segment_offset + cbo * block_size;
-            } else {
-                uint32_t linear_addr = ba + cbo * (uint32_t)block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
-                                    linear_addr);
-            }
-
             for (unsigned int channel = 0; channel < channels; channel++) {
+                unsigned int sample_bytes[] = {1, 2, 4, 4};
+                uint64_t linear = (uint64_t)cbo * block_size + channel * container_size;
+                uint8_t raw[4];
+                uint8_t *storage;
+                if (stream) {
+                    storage = mcpx_apu_dma_pointer(stream_source, linear, sample_bytes[sample_size]);
+                    if (sample_count == 0 && channel == 0)
+                        voice_record_source(v, segment_offset + linear, storage);
+                } else {
+                    linear += ba;
+                    if (sample_count == 0 && channel == 0) {
+                        MCPXAPUDmaBinding source = mcpx_apu_dma_sge_address(
+                            d, &d->vp.sge_table, d->regs[NV_PAPU_VPSGEADDR], linear);
+                        voice_record_source(v, source.physical, source.storage);
+                    }
+                    mcpx_apu_dma_sge_read(d, &d->vp.sge_table,
+                        d->regs[NV_PAPU_VPSGEADDR], linear, raw, sample_bytes[sample_size]);
+                    storage = raw;
+                }
                 uint32_t ival;
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(address_space_memory, addr);
+                    ival = *storage;
                     fval = uint8_to_float((uint8_t)(ival & 0xff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(address_space_memory, addr);
+                    ival = lduw_le_p(storage);
                     fval = int16_to_float((int16_t)(ival & 0xffff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_p(storage);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_p(storage);
                     fval = int32_to_float(ival);
                     break;
                 default:
@@ -935,7 +1043,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     break;
                 }
                 samples[sample_count][channel] = fval;
-                addr += container_size;
             }
         }
 
@@ -1053,6 +1160,9 @@ static void voice_process(MCPXAPUState *d,
                                  NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
 
     struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
+    bool diagnostic = mcpx_apu_diagnostics_enabled();
+    if (diagnostic)
+        dbg->format = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, UINT32_MAX);
     dbg->active = true;
     dbg->stereo = stereo;
     dbg->paused = paused;
@@ -1094,6 +1204,11 @@ static void voice_process(MCPXAPUState *d,
     dbg->multipass = multipass;
 
     if (multipass) {
+        dbg->source_physical = 0;
+        dbg->source_storage = NULL;
+        dbg->adpcm_block_hash = 0;
+        dbg->adpcm_block_bytes = 0;
+        dbg->ssl_segment_format = 0;
         /* Read from multipass bin */
         int mp_bin = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
@@ -1123,7 +1238,6 @@ static void voice_process(MCPXAPUState *d,
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
         for (int channel = 0; channel < 2; channel++)
             dbg->source_peak = fmaxf(dbg->source_peak, fabsf(samples[i][channel]));
-    bool diagnostic = mcpx_apu_diagnostics_enabled();
     if (diagnostic) {
         dbg->source_peak_since_report =
             fmaxf(dbg->source_peak_since_report, dbg->source_peak);
@@ -1275,6 +1389,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    bool seen[MCPX_HW_MAX_VOICES] = {false};
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1284,13 +1399,15 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
         d->regs[current] = d->regs[top];
 
-        for (int i = 0; d->regs[current] != 0xFFFF; i++) {
-            if (i >= MCPX_HW_MAX_VOICES) {
-                DPRINTF("Voice list contains invalid entry!\n");
+        while (d->regs[current] != 0xFFFF) {
+            uint32_t handle = d->regs[current];
+            if (handle >= MCPX_HW_MAX_VOICES || seen[handle]) {
+                voice_list_error(d, "invalid or repeated frame voice", list, handle);
                 break;
             }
+            seen[handle] = true;
 
-            uint16_t v = (uint16_t)d->regs[current];
+            uint16_t v = (uint16_t)handle;
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
@@ -1338,17 +1455,27 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
 {
-    (void)d;
+    mcpx_apu_dma_free_table(&d->vp.sge_table);
+    mcpx_apu_dma_free_table(&d->vp.ssl_table);
 }
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)
 {
+    memset(&d->vp.voice_table, 0, sizeof(d->vp.voice_table));
+    memset(&d->vp.notify_table, 0, sizeof(d->vp.notify_table));
+    mcpx_apu_dma_reset_table(&d->vp.sge_table);
+    mcpx_apu_dma_reset_table(&d->vp.ssl_table);
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    d->vp.voice_relinks = 0;
+    d->vp.voice_list_errors = 0;
+    d->vp.frontend_trapped_ticks = 0;
+    d->vp.frontend_halted_ticks = 0;
+    d->vp.inactive_ticks = 0;
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         voice_reset_resampler(&d->vp.filters[v]);
         hrtf_filter_init(&d->vp.filters[v].hrtf);

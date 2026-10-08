@@ -120,6 +120,7 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
     for (i = 0; i < s_dsp_ack_count; i++) {
         uint64_t physical = s_dsp_ack[i].offset;
         uint32_t processor = s_dsp_ack[i].processor;
+        uint8_t *storage;
         if (processor) {
             uint32_t table = qatomic_read(&d->regs[processor == 1 ? NV_PAPU_GPSADDR : NV_PAPU_EPSADDR]);
             if (!table) continue;
@@ -130,11 +131,20 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
                         s_dsp_ack[i].offset, last);
                 exit(EXIT_FAILURE);
             }
-            uint32_t base = ldl_le_phys(address_space_memory, (uint64_t)table + page * NV_PSGE_SIZE) & 0xFFFFF000u;
+            MCPXAPUDmaTable *scratch = processor == 1
+                ? &d->gp.scratch_table : &d->ep.scratch_table;
+            scratch->page_aligned = true;
+            uint32_t base = ldl_le_p(mcpx_apu_dma_descriptor(d, scratch, table, page))
+                & 0xFFFFF000u;
             if (!base) continue;
-            physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
+            MCPXAPUDmaBinding address = mcpx_apu_dma_sge_address(
+                d, scratch, table, s_dsp_ack[i].offset);
+            physical = address.physical;
+            storage = mcpx_apu_dma_pointer(&address, 0, 4);
+        } else {
+            storage = mcpx_apu_dma_table_pointer(d, &d->absolute_ack[i], physical, 0, 4);
         }
-        volatile uint32_t *slot = (volatile uint32_t *)mcpx_apu_ram_address(physical, 4);
+        volatile uint32_t *slot = (volatile uint32_t *)storage;
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
@@ -160,6 +170,15 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     d->ep.realtime = false;
 
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
+}
+
+void mcpx_apu_dsp_finalize(MCPXAPUState *d)
+{
+    mcpx_apu_dma_free_table(&d->gp.scratch_table);
+    mcpx_apu_dma_free_table(&d->ep.scratch_table);
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    d->gp.dsp = d->ep.dsp = NULL;
 }
 
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)

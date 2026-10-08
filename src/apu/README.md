@@ -15,11 +15,33 @@ For integrations with separate memory banks, use
 `mcpx_apu_init_standalone_mapped` with the contiguous-bank base and
 `xbox_DmaPhysicalPointer`. Voice/descriptor allocations normally occupy that
 bank, but payloads can occupy ordinary low RAM. `MmGetPhysicalAddress` records
-page provenance so the resolver selects the correct, separate storage for
-physical reads/writes, streaming ADPCM copies and diagnostic acknowledgements.
-Invalid or mixed-bank extents are reported instead of reading unrelated data.
-This provenance model does not implement general physical aliasing when both
-banks reuse the same numeric offset.
+page provenance so the resolver can select separate backing storage when a DMA
+descriptor is programmed or first used. Audio retains that backing in
+descriptor-scoped bindings instead of resolving every fetch through mutable
+page provenance. Otherwise an unrelated allocation in the other bank can
+redirect a resident sound whose numeric physical address has not changed.
+
+Bindings cover voice/notification tables, frontend completion writes, SGE and
+SSL sources, and diagnostic GP/EP scratch mailboxes. SGE copies split at page
+boundaries, including non-adjacent physical pages; physically contiguous SSL
+buffers retain their captured bank across the linear extent. Bound accesses
+are checked against the bank span. Integrations must provide persistent,
+contiguous host backing for each RAM bank; the current constructor assumes
+64 MiB per bank.
+
+Programming a table/base register again invalidates its descriptor bindings,
+even when the numeric value is unchanged. Explicit SGE/SSL offset programming
+also recaptures source backing for same-value reallocation. Changed descriptor
+addresses written directly into bound table memory are detected on access.
+VP reset invalidates its tables; GP/EP reset-register writes invalidate their
+scratch bindings. Cache capacity is reused across resets and released at
+shutdown. GP/EP register reads and instruction execution remain stubbed.
+
+A direct guest descriptor write of the same physical value cannot identify a
+bank change without an explicit programming/reset event. Unused descriptors
+are bound on first access, not retroactively at allocation time. This is not a
+unified physical-memory/alias model and does not change guest physical-address
+encoding or GPU consumers.
 
 The legacy `mcpx_apu_init_standalone` constructor retains flat-RAM behavior
 for hosts with a single linear physical bank. Other integrations must supply
@@ -29,7 +51,10 @@ The VP produces 32 samples per tick. Eight DSP slices assemble one 256-frame
 stereo packet, submitted once every 5.33ms. The monitor preserves that packet
 and mixes software voices into it; it must not clear hardware output or
 generate 1024/2048 replacement frames each tick. Muting clears the packet,
-and the inactive-hardware path clears stale VP data before software mixing.
+and each tick clears only its current 32-frame slice before either the hardware
+or inactive-hardware path runs. Temporary front-end traps, halts and counter
+disables must not erase earlier slices in the packet. Preparing active slices
+also prevents VP-monitor accumulation when the eight-slice buffer wraps.
 
 XAudio2 queue saturation applies backpressure while releasing the APU lock.
 The waveOut fallback also waits before reusing an in-flight buffer. Submission
@@ -51,10 +76,61 @@ scalar samples, nonzero hardware samples, peak amplitude, test-tone and mute
 state. It also logs voice starts and interval source/routed-contribution
 peaks, retaining short-lived effects until the next report. Routed peaks are
 per-source contributions, not the final combined DSP output.
+Unset disables diagnostics in the runtime; `0` explicitly disables them across
+the VP, output report and XAudio2 backend. Ghost currently defaults the setting
+to `1` while its mission-reload degradation is under investigation.
+Route reports include the current voice format/base, most recently resolved
+payload physical address and backing pointer, raw SSL descriptor format and interval format-mismatch
+counts. These fields help distinguish bad source data/mapping from filter,
+mixdown and queue faults; collecting them does not change the decoding rules.
+`adpcm_hash` is a 32-bit FNV-1a fingerprint of the latest fetched compressed
+block, with its length in `adpcm_bytes`. It can be compared against local XWB
+blocks without recording audio payloads. PCM and multipass voices report zero
+length. `adpcm_bad_headers` counts fetched channel headers whose raw step index
+exceeds 88 during the reporting interval; existing decoder clamping is unchanged.
+The hash/address describe the latest fetch, whereas interval peaks and error
+counts can span multiple sounds that reuse one hardware voice.
 `RECOMP_APU_TRACE=1` traces MMIO. Nonzero samples alone do not establish
 correct DMA mapping, effects fidelity or a complete soundtrack.
 GP/EP remain passthrough stubs; AC97-ready and DSP-ack diagnostic overrides are
 not DSP56300 emulation.
+
+### Voice Reuse and Mission Restarts
+
+`VOICE_OFF` preserves linked-list membership and completion notifications for
+guest idle-voice handling. `VOICE_ON` now removes an existing occurrence before
+reinserting that hardware handle, including moves between the 2D, 3D and
+multipass lists. Inherited insertion preserves other voices and the pitch bits
+sharing the link word. A linked self antecedent restarts in place; an unlinked
+self antecedent is rejected with a diagnostic. Guest voice locks and normal
+envelope, stream and filter resets are preserved.
+
+Previously, stopping and starting a still-linked head could create a self-loop.
+An offscreen regression reproduced a quiet 0.01 signal becoming approximately
+2.56 after the walker mixed the same voice 256 times. Looping PCM reuse also
+advanced the source repeatedly and drove the combined signal above full scale.
+This can cause severe clipping without an output-device or queue failure.
+
+The frame walker now processes each handle at most once across all three lists,
+reporting invalid handles, cycles and cross-list duplicates as `[APU-LIST]`.
+Reports are rate-limited after the first eight (then powers of two); total counts
+remain visible in `RECOMP_APU_DIAG=1` output as `list_errors`. `relinks` counts
+starts that detached an existing entry. `fe_trap_ticks` and `fe_halt_ticks` count
+lightweight ticks caused by those front-end modes, while `inactive_ticks`
+counts all ticks skipping the hardware pipeline (including counter-off and
+test-tone operation). These counters reset with the VP.
+
+The `apu_voice_restart` regression in `tests/apu_mixdown` exercises 100
+stop/start cycles each for multipass and PCM sources, stable source advancement,
+unclipped PCM output, active head/middle/tail reuse, list migration, inherited
+and self-antecedent insertion, pitch preservation, notifications, guest locks,
+natural completion and malformed-list guards. It also invokes the actual core
+frame tick to check a trap, halt or counter disable at every packet phase,
+stopped-voice idle-trap interrupts, and 32 VP-monitor packets without
+accumulation. It uses real VP methods and the
+DSP passthrough without an output device or background audio thread.
+This reproduces and fixes a hardware-voice accumulation bug; StarCraft: Ghost
+mission-reload audio still requires a controlled gameplay verification.
 
 ### Diagnostic DSP Command Completion
 

@@ -51,6 +51,14 @@ struct McpxApuDebugVoice
     int container_size, sample_size;
     unsigned int samples_per_block;
     uint32_t ebo, cbo, lbo, ba;
+    uint32_t format;
+    uint32_t ssl_segment_format;
+    uint64_t source_physical;
+    void *source_storage;
+    uint32_t adpcm_block_hash;
+    uint32_t adpcm_block_bytes;
+    uint64_t adpcm_bad_headers_since_report;
+    uint64_t format_mismatches_since_report;
     float rate;
     float amplitude_envelope;
     float source_peak;

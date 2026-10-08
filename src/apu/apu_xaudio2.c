@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "apu_debug.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -89,7 +90,7 @@ int xa2_init(void)
     g_xa2_empty_queue_events = 0;
     g_xa2_last_report = 0;
     g_xa2_started = 0;
-    g_xa2_diagnostic = getenv("RECOMP_APU_DIAG") != NULL;
+    g_xa2_diagnostic = mcpx_apu_diagnostics_enabled();
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
