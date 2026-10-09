@@ -10,5 +10,6 @@ target_include_directories(xbox_video PUBLIC
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
 if(WIN32)
-    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+    target_sources(xbox_video PRIVATE fb_present_d3d11.cpp)
+    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 d3d11 dxgi d3dcompiler)
 endif()

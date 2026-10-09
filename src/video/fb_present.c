@@ -7,10 +7,8 @@
  * implemented, none of it is observable. This is the other half: a window that
  * reads that memory and puts it on screen.
  *
- * Deliberately plain GDI rather than the D3D8 layer. The point is to display
- * whatever the guest actually wrote, so the fewer stages between guest memory
- * and the screen the better -- and it must keep working while the D3D8 layer
- * is busy with something else, such as the FMV player's own window.
+ * Independent of the D3D8 layer, with optional D3D11 presentation so window
+ * scaling does not repeatedly stretch the framebuffer on the CPU.
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
@@ -22,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "fb_present_d3d11.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_WatchdogFramePresent(void);
@@ -29,6 +28,10 @@ int xbox_FramebufferDumpBmp(const char *path);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
+static uint32_t      s_window_scale = 1;
+static int          s_use_gpu;
+static volatile LONG s_repaint = 1;
+static SRWLOCK      s_present_lock = SRWLOCK_INIT;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
 /* A finished frame, taken at the flip and shown until the next one.
@@ -48,6 +51,13 @@ static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
 static LARGE_INTEGER s_stats_frequency, s_stats_start;
 static LONG64 s_stats_initial_frame;
 static volatile LONG s_stats_ready, s_stats_reported;
+static DECLSPEC_ALIGN(8) volatile LONG64 s_source_updates, s_display_presents;
+
+void xbox_FramebufferPresentationCounts(uint64_t *source_updates, uint64_t *presents)
+{
+    *source_updates = (uint64_t)InterlockedCompareExchange64(&s_source_updates, 0, 0);
+    *presents = (uint64_t)InterlockedCompareExchange64(&s_display_presents, 0, 0);
+}
 
 void xbox_FramebufferStatsReport(void)
 {
@@ -67,6 +77,10 @@ void xbox_FramebufferStatsReport(void)
     fps = (double)(frame - s_stats_initial_frame) / elapsed;
     fprintf(stderr, "[FBWIN] Average %.2f FPS | Frame %llu | Elapsed %.3f seconds\n",
             fps, (unsigned long long)frame, elapsed);
+    fprintf(stderr, "[FBWIN] presentation %s | Source updates %llu | Presents %llu\n",
+            s_use_gpu ? "D3D11" : "GDI",
+            (unsigned long long)InterlockedCompareExchange64(&s_source_updates, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&s_display_presents, 0, 0));
     fflush(stderr);
 }
 
@@ -95,15 +109,20 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     xbox_WatchdogFramePresent();
     if (!s_fb_running)
         return;
-    InterlockedIncrement64(&s_present_frame);
-    if (getenv("RECOMP_FB_VA"))
+    if (getenv("RECOMP_FB_VA")) {
+        InterlockedIncrement64(&s_present_frame);
         return;                       /* pinned: leave the old path alone */
+    }
+    AcquireSRWLockExclusive(&s_present_lock);
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                              4);
-        if (!s_present[next])
+        if (!s_present[next]) {
+            fprintf(stderr, "[FBWIN] cannot allocate finished-frame buffer\n");
+            ReleaseSRWLockExclusive(&s_present_lock);
             return;
+        }
     }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
@@ -128,6 +147,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    InterlockedIncrement64(&s_present_frame);
+    ReleaseSRWLockExclusive(&s_present_lock);
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
@@ -162,6 +183,18 @@ static void fb_exit_process(void)
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        BeginPaint(h, &paint);
+        EndPaint(h, &paint);
+        InterlockedExchange(&s_repaint, 1);
+        return 0;
+    }
+    case WM_SIZE:
+        InterlockedExchange(&s_repaint, 1);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
     case WM_CLOSE:
         fb_exit_process();
         return 0;
@@ -216,13 +249,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* The display formats an Xbox front buffer is actually set to. The pitch says
  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
  * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-static void fb_convert(const uint8_t *src, uint32_t bpp)
+static void fb_convert(const uint8_t *src, uint32_t bpp, uint32_t *converted)
 {
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
         const uint8_t *row = src + (size_t)y * s_fb_pitch;
-        uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
+        uint32_t *dst = converted + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
@@ -355,7 +388,13 @@ static void fb_load_window_icons(HMODULE module, FbWindowIcons *icons)
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
-    HDC hdc;
+    HDC hdc = NULL;
+    FbGpuPresenter *gpu = NULL;
+    uint32_t *probe = NULL;
+    uint32_t client_width = 0, client_height = 0;
+    LONG64 copied_frame = -1;
+    int has_image = 0;
+    size_t image_bytes = (size_t)s_fb_width * s_fb_height * 4;
     BITMAPINFO bi;
     RECT r;
     const char *window_title = getenv("RECOMP_WINDOW_TITLE");
@@ -396,8 +435,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             return 0;
         }
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    r.left = 0; r.top = 0;
+    r.right = (LONG)(s_fb_width * s_window_scale);
+    r.bottom = (LONG)(s_fb_height * s_window_scale);
+    if (!AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE)) {
+        fprintf(stderr, "[FBWIN] framebuffer window sizing failed: error %lu\n", GetLastError());
+        InterlockedExchange(&s_fb_running, 0);
+        free(caption);
+        return 0;
+    }
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
                            title_stats ? caption : game_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -412,7 +458,20 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icons.large_icon);
     SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icons.small_icon);
-    hdc = GetDC(hwnd);
+    if (s_use_gpu) {
+        if (!GetClientRect(hwnd, &r)) {
+            fprintf(stderr, "[FBWIN] framebuffer client sizing failed: error %lu\n", GetLastError());
+            goto done;
+        }
+        gpu = fb_gpu_create(hwnd, s_fb_width, s_fb_height, (uint32_t)r.right, (uint32_t)r.bottom);
+        if (!gpu) goto done;
+    } else {
+        hdc = GetDC(hwnd);
+        if (!hdc || !SetStretchBltMode(hdc, COLORONCOLOR)) {
+            fprintf(stderr, "[FBWIN] framebuffer display setup failed: error %lu\n", GetLastError());
+            goto done;
+        }
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -423,12 +482,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     bi.bmiHeader.biCompression = BI_RGB;
 
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    probe = (uint32_t *)malloc(image_bytes);
+    if (!s_rgb || !probe) {
+        fprintf(stderr, "[FBWIN] cannot allocate native presentation snapshots\n");
+        goto done;
+    }
 
-    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
-            s_fb_width, s_fb_height);
+    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u source, %ux%u client, %ux scale)\n",
+            s_fb_width, s_fb_height, s_fb_width * s_window_scale, s_fb_height * s_window_scale,
+            s_window_scale);
 
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
+        int upload = 0, redraw;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT)
                 fb_exit_process();
@@ -458,34 +524,64 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 title_frame = frame;
             }
         }
+        if (!GetClientRect(hwnd, &r)) {
+            fprintf(stderr, "[FBWIN] framebuffer client sizing failed: error %lu\n", GetLastError());
+            InterlockedExchange(&s_fb_running, 0);
+            break;
+        }
+        if (r.right <= 0 || r.bottom <= 0) {
+            Sleep(16);
+            continue;
+        }
         if (s_present_idx >= 0 && s_rgb) {
-            /* A finished frame, published by the flip. Copied into s_rgb so
-             * the dump path and GDI see one consistent image even if the
-             * next flip lands mid-blit. */
-            LONG idx = s_present_idx;
-            if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            LONG64 frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+            if (frame != copied_frame) {
+                AcquireSRWLockShared(&s_present_lock);
+                memcpy(probe, s_present[s_present_idx], image_bytes);
+                copied_frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+                ReleaseSRWLockShared(&s_present_lock);
+                upload = !has_image || memcmp(s_rgb, probe, image_bytes) != 0;
+            }
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_convert(src, s_fb_pitch / s_fb_width, probe);
+            upload = !has_image || memcmp(s_rgb, probe, image_bytes) != 0;
+        }
+        if (upload) {
+            memcpy(s_rgb, probe, image_bytes);
+            has_image = 1;
+        }
+        redraw = InterlockedExchange(&s_repaint, 0) ||
+                 client_width != (uint32_t)r.right || client_height != (uint32_t)r.bottom;
+        if (has_image && (upload || redraw)) {
+            if (gpu) {
+                if (!fb_gpu_draw(gpu, s_rgb, (uint32_t)r.right, (uint32_t)r.bottom, upload))
+                    break;
+            } else if (StretchDIBits(hdc, 0, 0, r.right, r.bottom,
+                       0, 0, (int)s_fb_width, (int)s_fb_height,
+                       s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY) == GDI_ERROR) {
+                fprintf(stderr, "[FBWIN] framebuffer blit failed: error %lu\n", GetLastError());
+                break;
+            }
+            if (upload) InterlockedIncrement64(&s_source_updates);
+            InterlockedIncrement64(&s_display_presents);
+            client_width = (uint32_t)r.right;
+            client_height = (uint32_t)r.bottom;
         }
         Sleep(16);
     }
 
-    ReleaseDC(hwnd, hdc);
+done:
+    InterlockedExchange(&s_fb_running, 0);
+    fb_gpu_destroy(gpu);
+    if (hdc) ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(caption);
     free(s_rgb);
+    free(probe);
     s_rgb = NULL;
     return 0;
 }
@@ -493,9 +589,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
+    const char *scale = getenv("RECOMP_FB_SCALE");
+    const char *backend = getenv("RECOMP_FB_D3D11");
 
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
+    if (scale && *scale && (scale[0] < '1' || scale[0] > '4' || scale[1])) {
+        fprintf(stderr, "[FBWIN] invalid RECOMP_FB_SCALE: '%s'; expected 1, 2, 3 or 4\n", scale);
+        InterlockedExchange(&s_fb_running, 0);
+        return;
+    }
+    s_window_scale = scale && *scale ? (uint32_t)(scale[0] - '0') : 1;
+    if (backend && *backend && ((backend[0] != '0' && backend[0] != '1') || backend[1])) {
+        fprintf(stderr, "[FBWIN] invalid RECOMP_FB_D3D11: '%s'; expected 0 or 1\n", backend);
+        InterlockedExchange(&s_fb_running, 0);
+        return;
+    }
+    s_use_gpu = backend && backend[0] == '1';
+    InterlockedExchange(&s_repaint, 1);
     if (!InterlockedCompareExchange(&s_stats_ready, 0, 0)) {
         if (!QueryPerformanceFrequency(&s_stats_frequency) || s_stats_frequency.QuadPart <= 0 ||
             !QueryPerformanceCounter(&s_stats_start))
@@ -516,6 +627,10 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferStatsReport(void) {}
+void xbox_FramebufferPresentationCounts(uint64_t *source_updates, uint64_t *presents)
+{
+    *source_updates = *presents = 0;
+}
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
