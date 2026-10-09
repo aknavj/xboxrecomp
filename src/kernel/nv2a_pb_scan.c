@@ -27,6 +27,9 @@
 #include <string.h>
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#ifdef _WIN32
+#include "nv2a_gpu_memory.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -239,6 +242,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     uint32_t va = start_va;
     uint32_t words = 0, jumps = 0, unknown = 0;
     volatile uint32_t *dma_get = NULL;
+#ifdef _WIN32
+    int track_memory = nv2a_gpu_memory_active();
+    uint32_t next_memory_service = 0;
+#endif
 
     if (s_exec_enabled < 0)
         s_exec_enabled = 1;
@@ -265,6 +272,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         _Exit(EXIT_FAILURE);
     }
     while (va != end_va && words < 0x100000u) {
+#ifdef _WIN32
+        if (track_memory && words >= next_memory_service) {
+            nv2a_gpu_memory_service();
+            next_memory_service = words + 256;
+        }
+#endif
         if ((va & 3u) || va < address_base || (uint64_t)va + 4 > (uint64_t)address_base + XBOX_CONTIG_SIZE) {
             fprintf(stderr, "[PB] invalid command address 0x%08X\n", va);
             failure_context(start_va, end_va, va, words, pending_count, pending_method, return_va);

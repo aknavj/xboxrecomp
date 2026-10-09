@@ -22,6 +22,7 @@ typedef enum Nv2aGpuSyncReason {
 	NV2A_GPU_SYNC_TARGET_CACHE,
 	NV2A_GPU_SYNC_TEXTURE_ALIAS,
 	NV2A_GPU_SYNC_INVALIDATE,
+	NV2A_GPU_SYNC_CPU_ACCESS,
 	NV2A_GPU_SYNC_REASON_COUNT
 } Nv2aGpuSyncReason;
 void nv2a_gpu_sync(void);
@@ -29,6 +30,11 @@ void nv2a_gpu_flush(void);
 void nv2a_gpu_flush_reason(Nv2aGpuSyncReason reason);
 void nv2a_gpu_invalidate(void);
 void nv2a_gpu_report(void);
+typedef struct Nv2aGpuSyncCounters {
+	uint64_t completion_waits, asynchronous_idle_boundaries;
+} Nv2aGpuSyncCounters;
+/* Read on the rendering thread, like the other backend diagnostics. */
+Nv2aGpuSyncCounters nv2a_gpu_sync_counters(void);
 
 #define NV2A_GPU_MAX_VERTICES 65536u
 #define NV2A_GPU_MAX_INDICES 196608u
@@ -48,7 +54,7 @@ typedef struct Nv2aGpuTexture {
 	const uint8_t *source;
 	uint32_t source_bytes, width, height, pitch, format, linear, address_u, address_v;
 	uint32_t cube, face_stride;
-	uint32_t depth;
+	uint32_t depth; /* Volume extent; depth-texture storage is selected by format. */
 	uint32_t address_w, filter, control0, control0_valid, border_color;
 	uint32_t color_key;
 	uint32_t mip_levels;
@@ -85,6 +91,7 @@ typedef struct Nv2aGpuDraw {
 	uint32_t stage_program, alpha_enable, alpha_function, alpha_reference, control0;
 	uint32_t shader_clip_mode, shader_other_stage_input;
 	uint32_t shader_dot_mapping;
+	uint32_t shadow_depth_function;
 	float shader_eye_vector[3];
 	uint32_t shader_eye_vector_valid;
 	uint32_t fog_enable, fog_mode;

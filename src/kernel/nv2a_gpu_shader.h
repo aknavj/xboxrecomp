@@ -14,6 +14,7 @@ cbuffer State : register(b0) {
  float4 depthRange;
  float4 depthOffset;
  float4 shaderEyeVector;
+ uint4 shadowControl;
  float4 vertexConstants[192];
  uint4 lightState;      /* x=lighting_enable, y=specular_enable, z=light_enable_mask, w=color_material */
  uint4 lightControl;    /* flags, normalization, skin mode, texgen viewer */
@@ -400,6 +401,16 @@ float4 texture_color_sign(float4 color,uint mask) {
  if(mask&1)color.a=2*color.a-1;
  return color;
 }
+bool compare_shadow(uint function,float sampled,float reference) {
+ if(function==0)return false;
+ if(function==1)return sampled<reference;
+ if(function==2)return sampled==reference;
+ if(function==3)return sampled<=reference;
+ if(function==4)return sampled>reference;
+ if(function==5)return sampled!=reference;
+ if(function==6)return sampled>=reference;
+ return true;
+}
 PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
  float4 registers[16]; [unroll]for(uint index=0;index<16;index++)registers[index]=0;
  registers[4]=input.diffuse; registers[5]=input.specular; registers[3]=float4(fogColor.rgb,saturate(input.fog));
@@ -436,7 +447,7 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
     sampleDirection=2*sampleDirection*dot(sampleDirection,eye)/dot(sampleDirection,sampleDirection)-eye;
    }
   }
-  if((mode==1 || mode==3 || mode==6 || mode==7 || mode==9 || mode==11 || mode==12 || mode==14 || mode==15 || mode==16 || mode==18) && !(textureFlags&2)) {
+  if((mode==1 || (mode==2 && (textureFlags&64)) || mode==3 || mode==6 || mode==7 || mode==9 || mode==11 || mode==12 || mode==14 || mode==15 || mode==16 || mode==18) && !(textureFlags&2)) {
    float2 uv=mode==3 || mode==11 || mode==12 || mode==14 || mode==18?cube_plane_coordinates(sampleDirection):coordinate.xy/coordinate.w;
      if(mode==6 || mode==7) {
         uint sourceStage=stage==1?0:(textureControl.x>>(stage*4+8))&15;
@@ -471,7 +482,7 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
   default:value=cube3.Sample(sampler3,direction);break;
    }
   }
-  if(mode==2) {
+  if(mode==2 && !(textureFlags&64)) {
    float3 uvw=coordinate.xyz/coordinate.w;
    float3 gradientX=ddx(uvw),gradientY=ddy(uvw);
    if(textureFlags&4)uvw.x=saturate(uvw.x);
@@ -484,6 +495,11 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    default:value=volume3.SampleGrad(sampler3,uvw,gradientX,gradientY);break;
    }
   }
+    if(textureFlags&64) {
+     float maximum=(textureFlags&128)?16777215.0:65535.0;
+     float reference=mode==2?clamp(coordinate.z/coordinate.w,0,maximum):0;
+     value=compare_shadow(shadowControl.x,value.r*maximum,reference)?1:0;
+    }
     if(textureFlags&1)value.a=1;
     value=texture_color_sign(value,TEXTURE_SIGN(stage));
     if(mode==7) {

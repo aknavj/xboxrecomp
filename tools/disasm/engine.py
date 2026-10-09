@@ -538,6 +538,30 @@ class DisasmEngine:
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
 
+    def probes_as_padded_tail_thunk(self, addr: int) -> bool:
+        """Recognize a seeded rel32 tail jump between int3 padding runs."""
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        offset = addr - section.virtual_addr
+        if offset < 3 or offset + 8 > min(len(data), section.virtual_size):
+            return False
+        if data[offset - 3:offset] != b"\xcc" * 3:
+            return False
+        if data[offset + 5:offset + 8] != b"\xcc" * 3:
+            return False
+        insn = next(self._cs.disasm(data[offset:offset + 5], addr, count=1), None)
+        if (insn is None or insn.size != 5 or insn.mnemonic != "jmp"
+                or len(insn.operands) != 1 or insn.operands[0].type != CS_OP_IMM):
+            return False
+        target = insn.operands[0].imm & 0xFFFFFFFF
+        if addr - 3 <= target < addr + 8:
+            return False
+        target_section = self.image.get_section_at_va(target)
+        return (target_section is not None and target_section.executable
+                and self.get_instruction(target) is not None)
+
     def probes_as_prologue(self, addr: int) -> bool:
         """
         Read-only: do the bytes at `addr` start with a recognisable MSVC

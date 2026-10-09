@@ -78,7 +78,8 @@ peaks, retaining short-lived effects until the next report. Routed peaks are
 per-source contributions, not the final combined DSP output.
 Unset disables diagnostics in the runtime; `0` explicitly disables them across
 the VP, output report and XAudio2 backend. Ghost currently defaults the setting
-to `1` while its mission-reload degradation is under investigation.
+to `0` after the DMA ownership fix and the user's positive gameplay report.
+Set it explicitly to `1` when capturing another audio problem.
 Route reports include the current voice format/base, most recently resolved
 payload physical address and backing pointer, raw SSL descriptor format and interval format-mismatch
 counts. These fields help distinguish bad source data/mapping from filter,

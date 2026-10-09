@@ -26,6 +26,32 @@ All 371 ordinals are routed: every export now has either a per-ordinal `bridge_*
 | `kernel_pool.c` | 49 | Pool memory allocator |
 | `kernel_xbox.c` | 121 | Misc Xbox APIs (XeLoadSection, etc.) |
 
+## Optional Hang Snapshots
+
+Call `xbox_WatchdogStart()` on the thread that runs guest code. It remains off
+unless `RECOMP_WATCHDOG_SECS` or `RECOMP_WATCHDOG_FRAME_MS` is nonzero. The default periodic one-shot
+mode captures diagnostics, reports framebuffer statistics and exits with code 3.
+`RECOMP_WATCHDOG_REPEAT=1` instead captures nonfatal snapshots at that interval,
+stopping after 64 samples without terminating the application or requesting
+framebuffer statistics/feedback dumps on each sample.
+The frame interval instead captures nonfatal `frame stall` snapshots after
+flips stop for that many milliseconds, only after the first valid flip.
+`xbox_WatchdogFramePresent()` supplies progress from the framebuffer presenter
+even with its window disabled. Each stall is captured once, then re-armed by
+new frame progress. Startup and ongoing progress are not stalls. All capture
+modes share the 64-snapshot limit; a configured periodic interval keeps its
+existing one-shot/repeat semantics. Invalid intervals are reported explicitly.
+Memory shutdown signals and joins the capture thread before releasing guest
+mappings. A stop failure is logged and exits with code 3 to avoid sampling
+unmapped memory.
+
+Snapshots include the caller's thread-local guest registers and stack, recent
+indirect targets and their count, peeks, and NV2A DMA pointers. On Windows x64,
+native context is sampled by briefly suspending/resuming that guest thread.
+Thread/context failures are logged. Native symbols and source lines require
+an initialized DbgHelp session and a matching PDB; serialize DbgHelp calls with
+`g_xbox_debug_symbols_lock`, including initialization and fault reporting.
+
 ## Memory Layout
 
 The Xbox has 64 MB of unified RAM. We reproduce the exact address layout using `CreateFileMapping` + `MapViewOfFileEx`:
@@ -87,10 +113,44 @@ ptrdiff_t xbox_GetMemoryOffset(void);  // g_xbox_mem_offset value
 BOOL      xbox_IsXboxAddress(uintptr_t address);
 HANDLE    xbox_GetMappingHandle(void); // For creating additional mirror views
 
-// Heap (bump allocator, no free)
+// Heap (bump allocation with freed-block reuse and coalescing)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
-void     xbox_HeapFree(uint32_t xbox_va);  // No-op currently
+void     xbox_HeapFree(uint32_t xbox_va);
+uint32_t xbox_HeapBlockBase(uint32_t xbox_va);
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+BOOL     xbox_HeapReleaseRange(uint32_t xbox_va, uint32_t size);
 ```
+
+### Guest Virtual-Memory Frees
+
+The ordinal 184/199 bridges use 32-bit guest IN/OUT fields. Guest heap storage
+must not be passed to native `VirtualFree`, nor may guest pointer/size cells be
+read as native `PVOID*`/`PSIZE_T` on an x64 host.
+
+For heap-backed virtual allocations, `MEM_RELEASE` returns whole or partial
+ranges to the guest allocator. Partial releases preserve live fragments on
+both sides; coalescing removes obsolete metadata entries so later frees can
+still combine adjacent ranges. Xbox permits a nonzero release size, unlike
+the usual Windows whole-region-only release contract. Successful frees report
+the affected base and size through the guest-width fields.
+The reference behavior is documented by
+[`VMManager::XbFreeVirtualMemory`](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/memory-manager/VMManager.cpp#L1528).
+
+`MEM_DECOMMIT` retains ownership of the reservation. The current eagerly backed
+arena clears the affected pages, so recommit sees zero-filled memory; it does
+not return those reserved addresses to other heap users. This is not a complete
+reserve/commit physical-page manager. Address-only reservations above RAM made
+by `xbox_ReserveAlloc` remain outside this heap-backed free implementation and
+are explicitly rejected rather than passed to the host allocator.
+
+Virtual allocation sizes and free ranges are page-rounded, with overflow and
+allocation-boundary checks. Reusing a larger free block returns its unused tail
+to the heap rather than consuming more space than the reported reservation.
+The Windows offscreen regression in
+[`tests/kernel_virtual_memory`](../../tests/kernel_virtual_memory/README.md)
+exercises the real thunk dispatcher, partial release, decommit/recommit,
+32-bit field sentinels, invalid ranges, and 16 successive 8 MiB allocation/
+release cycles.
 
 ### Customizing for Your Game
 

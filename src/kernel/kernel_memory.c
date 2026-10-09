@@ -14,6 +14,7 @@
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
+#include "nv2a_gpu_memory.h"
 #endif
 
 /* ============================================================================
@@ -196,7 +197,11 @@ VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfB
 ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 {
     MEMORY_BASIC_INFORMATION mbi;
+#if defined(_WIN32)
+    if (nv2a_gpu_memory_virtual_query(VirtualAddress, &mbi, sizeof(mbi))) {
+#else
     if (VirtualQuery(VirtualAddress, &mbi, sizeof(mbi))) {
+#endif
         /* Return the Xbox-equivalent protection */
         return mbi.Protect;
     }
@@ -206,14 +211,22 @@ ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)
 {
     DWORD old_protect;
+#if defined(_WIN32)
+    nv2a_gpu_memory_virtual_protect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
+#else
     VirtualProtect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
+#endif
     XBOX_TRACE(XBOX_LOG_MEM, "MmSetAddressProtect(%p, %u, 0x%X)", BaseAddress, NumberOfBytes, NewProtect);
 }
 
 ULONG __stdcall xbox_MmQueryAllocationSize(PVOID BaseAddress)
 {
     MEMORY_BASIC_INFORMATION mbi;
+#if defined(_WIN32)
+    if (nv2a_gpu_memory_virtual_query(BaseAddress, &mbi, sizeof(mbi))) {
+#else
     if (VirtualQuery(BaseAddress, &mbi, sizeof(mbi))) {
+#endif
         return (ULONG)mbi.RegionSize;
     }
     return 0;
@@ -327,7 +340,11 @@ NTSTATUS __stdcall xbox_NtQueryVirtualMemory(
 {
     MEMORY_BASIC_INFORMATION mbi;
 
+#if defined(_WIN32)
+    if (!nv2a_gpu_memory_virtual_query(BaseAddress, &mbi, sizeof(mbi)))
+#else
     if (!VirtualQuery(BaseAddress, &mbi, sizeof(mbi)))
+#endif
         return STATUS_INVALID_PARAMETER;
 
     /*

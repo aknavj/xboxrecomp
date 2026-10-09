@@ -38,9 +38,21 @@ target_include_directories(xbox_kernel PUBLIC
 )
 
 if(WIN32)
-    target_sources(xbox_kernel PRIVATE nv2a_gpu_d3d11.cpp)
+    add_library(nv2a_gpu_simd STATIC nv2a_gpu_simd.cpp)
+    target_compile_features(nv2a_gpu_simd PUBLIC cxx_std_17)
+    if(MSVC_CXX_ARCHITECTURE_ID MATCHES "^(x64|X86)$" OR
+       (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|i.86)$"))
+        target_sources(nv2a_gpu_simd PRIVATE nv2a_gpu_simd_avx2.cpp)
+        target_compile_definitions(nv2a_gpu_simd PRIVATE NV2A_GPU_SIMD_AVX2)
+        if(MSVC)
+            set_source_files_properties(nv2a_gpu_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+        else()
+            set_source_files_properties(nv2a_gpu_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS -mavx2)
+        endif()
+    endif()
+    target_sources(xbox_kernel PRIVATE nv2a_gpu_d3d11.cpp nv2a_gpu_memory.cpp)
     target_compile_features(xbox_kernel PRIVATE cxx_std_17)
-    target_link_libraries(xbox_kernel PRIVATE d3d11 d3dcompiler)
+    target_link_libraries(xbox_kernel PRIVATE d3d11 d3dcompiler nv2a_gpu_simd)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)

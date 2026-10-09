@@ -20,11 +20,19 @@ if(WIN32)
         ../../src/kernel/nv2a_pb_scan.c
         ../../src/kernel/nv2a_pb_exec.c
         ../../src/kernel/nv2a_gpu_d3d11.cpp
+        ../../src/kernel/nv2a_gpu_memory.cpp
     )
     target_include_directories(nv2a_shader_smoke PRIVATE ../../src)
-    target_link_libraries(nv2a_shader_smoke PRIVATE platform d3d11 d3dcompiler)
+    target_link_libraries(nv2a_shader_smoke PRIVATE platform d3d11 d3dcompiler bcrypt nv2a_gpu_simd)
     target_compile_features(nv2a_shader_smoke PRIVATE cxx_std_17)
     target_compile_definitions(nv2a_shader_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    add_executable(nv2a_shader_cache_smoke test_nv2a_shader_cache.cpp)
+    target_compile_features(nv2a_shader_cache_smoke PRIVATE cxx_std_17)
+    target_compile_definitions(nv2a_shader_cache_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(nv2a_shader_cache_smoke PRIVATE d3dcompiler bcrypt)
+    add_executable(nv2a_gpu_simd_smoke test_nv2a_gpu_simd.cpp)
+    target_include_directories(nv2a_gpu_simd_smoke PRIVATE ../../src)
+    target_link_libraries(nv2a_gpu_simd_smoke PRIVATE nv2a_gpu_simd)
     if(MSVC)
         target_compile_options(d3d8_smoke PRIVATE /W3)
     endif()

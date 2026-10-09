@@ -845,6 +845,13 @@ static void bridge_NtAllocateVirtualMemory(void)
         g_eax = 0xC0000045u; /* STATUS_INVALID_PAGE_PROTECTION */
         return;
     }
+    if (size > UINT32_MAX - 0xFFF) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                 "NtAllocateVirtualMemory size cannot be page-rounded: %u", size);
+        g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
+        return;
+    }
+    size = (size + 0xFFF) & ~UINT32_C(0xFFF);
 
     /*
      * Xbox NtAllocateVirtualMemory supports two modes:
@@ -961,6 +968,16 @@ static void bridge_NtAllocateVirtualMemory(void)
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
+    uint32_t backing_size = xbox_HeapBlockSize(xbox_va);
+    if (backing_size > size &&
+        !xbox_HeapReleaseRange(xbox_va + size, backing_size - size)) {
+        xbox_HeapFree(xbox_va);
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                 "NtAllocateVirtualMemory cannot split reused block: base=0x%08X size=%u backing=%u",
+                 xbox_va, size, backing_size);
+        g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
+        return;
+    }
 
     /* Write back the allocated address and actual size */
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
@@ -969,10 +986,6 @@ static void bridge_NtAllocateVirtualMemory(void)
     g_eax = 0; /* STATUS_SUCCESS */
 }
 
-/* ── NtFreeVirtualMemory (ordinal 199) ────────────────────
- * NTSTATUS NtFreeVirtualMemory(PVOID *BaseAddress, PULONG FreeSize,
- *     ULONG FreeType)
- */
 /* -- NtQueryVirtualMemory (ordinal 217, 2 args = 8 bytes) --------------
  *
  * Xbox takes two arguments, not NT's four:
@@ -1043,14 +1056,63 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/* NtFreeVirtualMemory (ordinal 199) uses guest-width IN/OUT fields and
+ * releases the same allocator that NtAllocateVirtualMemory used. */
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+    uint32_t base = 0, size = 0;
+    g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+    if (!base_ptr || !size_ptr) goto failed;
+    base = BRIDGE_MEM32(base_ptr);
+    size = BRIDGE_MEM32(size_ptr);
+    if (free_type != MEM_RELEASE && free_type != MEM_DECOMMIT) goto failed;
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    uint32_t allocation_base = xbox_HeapBlockBase(base);
+    if (!allocation_base) {
+        g_eax = 0xC00000A0u; /* STATUS_MEMORY_NOT_ALLOCATED */
+        goto failed;
+    }
+    uint32_t allocation_size = xbox_HeapBlockSize(allocation_base);
+    uint32_t rounded_base = base & ~UINT32_C(0xFFF);
+    uint64_t end = ((uint64_t)base + size + 0xFFF) & ~UINT64_C(0xFFF);
+    uint64_t rounded_size = end - rounded_base;
+    if (!rounded_size) {
+        if (rounded_base != allocation_base) {
+            g_eax = 0xC000009Fu; /* STATUS_FREE_VM_NOT_AT_BASE */
+            goto failed;
+        }
+        rounded_size = allocation_size;
+    }
+    if (rounded_base < allocation_base ||
+        (uint64_t)rounded_base + rounded_size >
+            (uint64_t)allocation_base + allocation_size) {
+        g_eax = 0xC000009Eu; /* STATUS_UNABLE_TO_FREE_VM */
+        goto failed;
+    }
+    if (free_type == MEM_RELEASE) {
+        if (!xbox_HeapReleaseRange(rounded_base, (uint32_t)rounded_size)) {
+            g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
+            goto failed;
+        }
+    } else {
+        /* The guest arena is already backed. Keep its reservation owned and
+         * clear decommitted pages so the existing commit path sees zeroes. */
+        memset(XBOX_TO_NATIVE(rounded_base), 0, (size_t)rounded_size);
+    }
+    BRIDGE_MEM32(base_ptr) = rounded_base;
+    BRIDGE_MEM32(size_ptr) = (uint32_t)rounded_size;
+    XBOX_TRACE(XBOX_LOG_MEM, "NtFreeVirtualMemory(0x%08X, %u, 0x%X)",
+               rounded_base, (uint32_t)rounded_size, free_type);
+    g_eax = 0;
+    return;
+
+failed:
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+             "NtFreeVirtualMemory failed: base=0x%08X size=%u type=0x%X status=0x%08X",
+             base, size, free_type, g_eax);
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─

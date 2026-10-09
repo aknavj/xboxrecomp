@@ -24,6 +24,7 @@
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern void xbox_WatchdogFramePresent(void);
 int xbox_FramebufferDumpBmp(const char *path);
 
 static volatile LONG s_fb_running;
@@ -89,7 +90,10 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     LONG next;
     uint32_t bpp, x, y;
 
-    if (!s_fb_running || !fb_va || !pitch)
+    if (!fb_va || !pitch)
+        return;
+    xbox_WatchdogFramePresent();
+    if (!s_fb_running)
         return;
     InterlockedIncrement64(&s_present_frame);
     if (getenv("RECOMP_FB_VA"))

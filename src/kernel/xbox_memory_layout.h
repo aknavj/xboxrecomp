@@ -236,10 +236,18 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 size_t xbox_GetMappedSize(void);
 void xbox_ProtectMirrorsForDebug(void);
 
+#if defined(_WIN32)
+/* DbgHelp calls must be serialized across fault handlers and the watchdog. */
+extern SRWLOCK g_xbox_debug_symbols_lock;
+#endif
+
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
- * does nothing unless that variable is set. */
+ * RECOMP_WATCHDOG_REPEAT=1 instead captures nonfatal snapshots at that interval.
+ * RECOMP_WATCHDOG_FRAME_MS enables nonfatal snapshots after frame progress
+ * stops, once per stall, only after the first flip. Shared limit: 64 samples. */
 void xbox_WatchdogStart(void);
+void xbox_WatchdogFramePresent(void);
 
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
@@ -465,7 +473,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 /**
- * Free a block from the Xbox heap. Currently a no-op (bump allocator).
+ * Free a complete block from the Xbox heap, coalescing adjacent free blocks.
  */
 void xbox_HeapFree(uint32_t xbox_va);
 
@@ -476,6 +484,13 @@ void xbox_HeapFree(uint32_t xbox_va);
  * the translated address describes the whole guest mapping.
  */
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+
+/* Base of the live heap allocation containing this address, or 0. */
+uint32_t xbox_HeapBlockBase(uint32_t xbox_va);
+
+/* Release a range within one live allocation, preserving both remaining sides.
+ * Returns FALSE for an invalid range or insufficient block metadata capacity. */
+BOOL xbox_HeapReleaseRange(uint32_t xbox_va, uint32_t size);
 
 /**
  * Get the file mapping handle for the Xbox memory region.

@@ -22,10 +22,24 @@
 #include <setjmp.h>
 #if defined(_WIN32)
 #include <dbghelp.h>
+#include "nv2a_gpu_memory.h"
 #endif
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
+
+#if defined(_WIN32)
+SRWLOCK g_xbox_debug_symbols_lock = SRWLOCK_INIT;
+#endif
+
+static BOOL gpu_coherent_virtual_protect(void *memory, size_t bytes, DWORD protection, DWORD *previous)
+{
+#if defined(_WIN32)
+    return nv2a_gpu_memory_virtual_protect(memory, bytes, protection, previous);
+#else
+    return VirtualProtect(memory, bytes, protection, previous);
+#endif
+}
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -905,7 +919,13 @@ void xbox_Nv2aAcknowledgeHandshakes(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+#if defined(_WIN32)
+    nv2a_gpu_memory_set_thread();
+#endif
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+#if defined(_WIN32)
+        nv2a_gpu_memory_service();
+#endif
         if (regs[0x008704 / 4] & 1u)
             regs[0x008700 / 4] = 0;
         regs[0x008100 / 4] = 0;
@@ -1270,6 +1290,12 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+static unsigned s_watchdog_frame_ms;
+static volatile LONG s_watchdog_frame_enabled;
+static DECLSPEC_ALIGN(8) volatile LONG64 s_watchdog_last_flip;
+static int s_watchdog_repeat;
+static HANDLE s_watchdog_stop_event;
+static HANDLE s_watchdog_handle;
 #if defined(_WIN32)
 static DWORD s_watchdog_thread_id;
 #endif
@@ -1397,7 +1423,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
         s_watch_stepping = 0;
         watch_report();
-        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+        gpu_coherent_virtual_protect(g_watch_page, 4096, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -1408,7 +1434,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 
         if (fault >= (uintptr_t)g_watch_page
                 && fault < (uintptr_t)g_watch_page + 4096) {
-            if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+            if (!gpu_coherent_virtual_protect(g_watch_page, 4096, PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
             s_watch_stepping = 1;
             ep->ContextRecord->EFlags |= 0x100u;
@@ -1514,7 +1540,7 @@ static int watch_arm(uint32_t va)
                                          + g_watch_va)) & ~(uintptr_t)4095);
     g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
     if (!g_watch_veh
-            || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
+            || !gpu_coherent_virtual_protect(g_watch_page, 4096, PAGE_READONLY, &old)) {
         if (g_watch_veh) {
             RemoveVectoredExceptionHandler(g_watch_veh);
             g_watch_veh = NULL;
@@ -1587,19 +1613,28 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
-static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+void xbox_WatchdogFramePresent(void)
+{
+    if (InterlockedCompareExchange(&s_watchdog_frame_enabled, 0, 0))
+        InterlockedExchange64(&s_watchdog_last_flip, (LONG64)GetTickCount64());
+}
+
+static void xbox_watchdog_capture(unsigned sample, ULONGLONG frame_idle)
 {
     const uint8_t *mem;
     uint32_t esp, i;
 
-    (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
-
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
-            "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
+    if (frame_idle)
+        fprintf(stderr, "[WATCHDOG] nonfatal frame stall snapshot %u after %llums without a flip (threshold %ums); guest esp=0x%08X\n",
+                sample, (unsigned long long)frame_idle, s_watchdog_frame_ms, esp);
+    else if (s_watchdog_repeat)
+        fprintf(stderr, "[WATCHDOG] nonfatal snapshot %u at interval %us; guest esp=0x%08X\n",
+                sample, s_watchdog_secs, esp);
+    else
+        fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n", s_watchdog_secs, esp);
+    fprintf(stderr, "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
             s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
             s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
@@ -1639,10 +1674,17 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
             uintptr_t rip = 0;
             ctx.ContextFlags = CONTEXT_CONTROL;
             if (SuspendThread(thread) != (DWORD)-1) {
+                DWORD context_error = 0;
                 if (GetThreadContext(thread, &ctx))
                     rip = (uintptr_t)ctx.Rip;
-                ResumeThread(thread);
-            }
+                else
+                    context_error = GetLastError();
+                if (ResumeThread(thread) == (DWORD)-1)
+                    fprintf(stderr, "[WATCHDOG] cannot resume guest thread: %lu\n", GetLastError());
+                if (context_error)
+                    fprintf(stderr, "[WATCHDOG] cannot capture guest context: %lu\n", context_error);
+            } else
+                fprintf(stderr, "[WATCHDOG] cannot suspend guest thread: %lu\n", GetLastError());
             CloseHandle(thread);
             if (rip) {
                 char buffer[sizeof(SYMBOL_INFO) + 128] = {0};
@@ -1651,6 +1693,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 sym->SizeOfStruct = sizeof(SYMBOL_INFO);
                 sym->MaxNameLen = 127;
                 fprintf(stderr, "  host RIP=0x%llX", (unsigned long long)rip);
+                AcquireSRWLockExclusive(&g_xbox_debug_symbols_lock);
                 if (SymFromAddr(GetCurrentProcess(), (DWORD64)rip,
                                 &displacement, sym))
                     fprintf(stderr, " %s+0x%llX", sym->Name,
@@ -1661,12 +1704,15 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     line.SizeOfStruct = sizeof(line);
                     if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)rip,
                                  &line_displacement, &line))
-                    fprintf(stderr, " at %s:%lu", line.FileName,
-                        line.LineNumber);
+                        fprintf(stderr, " at %s:%lu", line.FileName,
+                                line.LineNumber);
                 }
+                ReleaseSRWLockExclusive(&g_xbox_debug_symbols_lock);
                 fprintf(stderr, "\n");
             }
-        }
+        } else
+            fprintf(stderr, "[WATCHDOG] cannot open guest thread %lu: %lu\n",
+                    s_watchdog_thread_id, GetLastError());
     }
 #endif
     /* The pushbuffer pointers, unconditionally.
@@ -1701,22 +1747,83 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
-    RECOMP_ICALL_FEEDBACK_DUMP();
-    xbox_FramebufferStatsReport();
-    _exit(3);
+}
+
+static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+{
+    unsigned sample = 0;
+    ULONGLONG next_interval = GetTickCount64() + s_watchdog_secs * 1000u;
+    LONG64 captured_flip = 0;
+    (void)unused;
+    while (sample < 64) {
+        ULONGLONG now = GetTickCount64();
+        DWORD timeout = s_watchdog_secs ? (now >= next_interval ? 0 : (DWORD)(next_interval - now)) : INFINITE;
+        if (s_watchdog_frame_ms) {
+            DWORD poll = s_watchdog_frame_ms / 4;
+            if (!poll) poll = 1;
+            if (poll > 250) poll = 250;
+            if (poll < timeout) timeout = poll;
+        }
+        DWORD wait = WaitForSingleObject(s_watchdog_stop_event, timeout);
+        if (wait == WAIT_OBJECT_0)
+            return 0;
+        if (wait != WAIT_TIMEOUT) {
+            fprintf(stderr, "[WATCHDOG] cannot wait for capture interval: %lu\n", GetLastError());
+            fflush(stderr);
+            return 1;
+        }
+        now = GetTickCount64();
+        LONG64 last_flip = InterlockedCompareExchange64(&s_watchdog_last_flip, 0, 0);
+        int interval_due = s_watchdog_secs && now >= next_interval;
+        int frame_due = s_watchdog_frame_ms && last_flip && last_flip != captured_flip &&
+                        now >= (ULONGLONG)last_flip &&
+                        now - (ULONGLONG)last_flip >= s_watchdog_frame_ms;
+        if (!interval_due && !frame_due)
+            continue;
+        xbox_watchdog_capture(++sample, interval_due ? 0 : now - (ULONGLONG)last_flip);
+        if (frame_due) captured_flip = last_flip;
+        if (interval_due) next_interval = GetTickCount64() + s_watchdog_secs * 1000u;
+        if (interval_due && !s_watchdog_repeat) {
+            RECOMP_ICALL_FEEDBACK_DUMP();
+            xbox_FramebufferStatsReport();
+            _exit(3);
+        }
+    }
+    fprintf(stderr, "[WATCHDOG] nonfatal capture limit reached (64 samples)\n");
+    InterlockedExchange(&s_watchdog_frame_enabled, 0);
+    fflush(stderr);
     return 0;
+}
+
+static unsigned xbox_watchdog_setting(const char *name, unsigned scale)
+{
+    const char *value = getenv(name);
+    char *end;
+    unsigned long number;
+    unsigned long maximum = (INFINITE - 1u) / scale;
+    if (!value || !*value) return 0;
+    number = strtoul(value, &end, 10);
+    if (*value < '0' || *value > '9' || *end || number > maximum) {
+        fprintf(stderr, "[WATCHDOG] invalid %s: expected integer 0..%lu\n", name, maximum);
+        return 0;
+    }
+    return (unsigned)number;
 }
 
 void xbox_WatchdogStart(void)
 {
-    const char *secs = getenv("RECOMP_WATCHDOG_SECS");
-    HANDLE h;
-
-    if (!secs || !*secs)
+    if (s_watchdog_handle) {
+        fprintf(stderr, "[WATCHDOG] capture thread is already started\n");
         return;
-    s_watchdog_secs = (unsigned)atoi(secs);
-    if (!s_watchdog_secs)
+    }
+    s_watchdog_secs = xbox_watchdog_setting("RECOMP_WATCHDOG_SECS", 1000);
+    s_watchdog_frame_ms = xbox_watchdog_setting("RECOMP_WATCHDOG_FRAME_MS", 1);
+    if (!s_watchdog_secs && !s_watchdog_frame_ms)
         return;
+    {
+        const char *repeat = getenv("RECOMP_WATCHDOG_REPEAT");
+        s_watchdog_repeat = repeat && *repeat && strcmp(repeat, "0") != 0;
+    }
 
     /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
      * be handed the address of the one that matters rather than reading its
@@ -1728,9 +1835,42 @@ void xbox_WatchdogStart(void)
 #if defined(_WIN32)
     s_watchdog_thread_id = GetCurrentThreadId();
 #endif
-    h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
-    if (h)
-        CloseHandle(h);
+    s_watchdog_stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!s_watchdog_stop_event) {
+        fprintf(stderr, "[WATCHDOG] cannot create stop event: %lu\n", GetLastError());
+        return;
+    }
+    InterlockedExchange64(&s_watchdog_last_flip, 0);
+    InterlockedExchange(&s_watchdog_frame_enabled, s_watchdog_frame_ms != 0);
+    s_watchdog_handle = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
+    if (!s_watchdog_handle) {
+        InterlockedExchange(&s_watchdog_frame_enabled, 0);
+        DWORD error = GetLastError();
+        if (!CloseHandle(s_watchdog_stop_event))
+            fprintf(stderr, "[WATCHDOG] cannot close stop event: %lu\n", GetLastError());
+        s_watchdog_stop_event = NULL;
+        fprintf(stderr, "[WATCHDOG] cannot create capture thread: %lu\n", error);
+    }
+}
+
+static void xbox_watchdog_stop(void)
+{
+    InterlockedExchange(&s_watchdog_frame_enabled, 0);
+    if (!s_watchdog_handle)
+        return;
+    if (!SetEvent(s_watchdog_stop_event) ||
+        WaitForSingleObject(s_watchdog_handle, INFINITE) != WAIT_OBJECT_0) {
+        fprintf(stderr, "[WATCHDOG] cannot stop capture thread before unmapping memory: %lu\n",
+                GetLastError());
+        fflush(stderr);
+        _exit(3);
+    }
+    if (!CloseHandle(s_watchdog_handle))
+        fprintf(stderr, "[WATCHDOG] cannot close capture thread: %lu\n", GetLastError());
+    if (!CloseHandle(s_watchdog_stop_event))
+        fprintf(stderr, "[WATCHDOG] cannot close stop event: %lu\n", GetLastError());
+    s_watchdog_handle = NULL;
+    s_watchdog_stop_event = NULL;
 }
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
@@ -2691,6 +2831,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     xbox_WatchInit();
+#if defined(_WIN32)
+    if (nv2a_gpu_memory_initialize()) {
+        Nv2aGpuMemoryView views[XBOX_NUM_MIRRORS + 1];
+        uint32_t count = 0;
+        views[count++] = (Nv2aGpuMemoryView){g_memory_base, g_memory_size};
+        for (int mirror = 0; mirror < XBOX_NUM_MIRRORS; mirror++)
+            if (g_mirror_views[mirror])
+                views[count++] = (Nv2aGpuMemoryView){g_mirror_views[mirror], g_memory_size};
+        nv2a_gpu_memory_add_mapping(g_mapping_handle, g_memory_size, views, count);
+        if (g_contig_mapping && g_contig_memory) {
+            count = 0;
+            views[count++] = (Nv2aGpuMemoryView){g_contig_memory, XBOX_CONTIG_SIZE};
+            if (g_tiled_view) {
+                size_t bytes = xbox_TiledApertureSize();
+                if (bytes > XBOX_CONTIG_SIZE) bytes = XBOX_CONTIG_SIZE;
+                views[count++] = (Nv2aGpuMemoryView){g_tiled_view, bytes};
+            }
+            nv2a_gpu_memory_add_mapping(g_contig_mapping, XBOX_CONTIG_SIZE, views, count);
+        }
+        fprintf(stderr, "  GPU target residency: protected CPU aliases and private publication views enabled\n");
+    }
+#endif
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -2715,7 +2877,7 @@ void xbox_ProtectMirrorsForDebug(void)
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         DWORD old;
         if (g_mirror_views[m] &&
-            VirtualProtect(g_mirror_views[m], g_memory_size,
+            gpu_coherent_virtual_protect(g_mirror_views[m], g_memory_size,
                            PAGE_READONLY, &old)) {
             n++;
         }
@@ -2726,6 +2888,10 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    xbox_watchdog_stop();
+#if defined(_WIN32)
+    nv2a_gpu_memory_shutdown();
+#endif
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
@@ -3226,7 +3392,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_TOP) {
+    if ((uint64_t)result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
@@ -3316,6 +3482,53 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
+uint32_t xbox_HeapBlockBase(uint32_t xbox_va)
+{
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].free &&
+            xbox_va >= g_heap_blocks[i].addr &&
+            xbox_va < g_heap_blocks[i].addr + g_heap_blocks[i].size)
+            return g_heap_blocks[i].addr;
+    }
+    return 0;
+}
+
+BOOL xbox_HeapReleaseRange(uint32_t xbox_va, uint32_t size)
+{
+    if (!size) return FALSE;
+    for (int i = 0; i < g_heap_block_count; i++) {
+        uint32_t base = g_heap_blocks[i].addr;
+        uint32_t block_size = g_heap_blocks[i].size;
+        if (g_heap_blocks[i].free || xbox_va < base ||
+            (uint64_t)xbox_va + size > (uint64_t)base + block_size)
+            continue;
+        uint32_t prefix = xbox_va - base;
+        uint32_t suffix = block_size - prefix - size;
+        int extra = (prefix != 0) + (suffix != 0);
+        if (g_heap_block_count + extra > XBOX_HEAP_MAX_BLOCKS) return FALSE;
+        memmove(&g_heap_blocks[i + extra + 1], &g_heap_blocks[i + 1],
+                (size_t)(g_heap_block_count - i - 1) * sizeof(g_heap_blocks[0]));
+        g_heap_block_count += extra;
+        int slot = i;
+        if (prefix) {
+            g_heap_blocks[slot].addr = base;
+            g_heap_blocks[slot].size = prefix;
+            g_heap_blocks[slot++].free = 0;
+        }
+        g_heap_blocks[slot].addr = xbox_va;
+        g_heap_blocks[slot].size = size;
+        g_heap_blocks[slot++].free = 0;
+        if (suffix) {
+            g_heap_blocks[slot].addr = xbox_va + size;
+            g_heap_blocks[slot].size = suffix;
+            g_heap_blocks[slot].free = 0;
+        }
+        xbox_HeapFree(xbox_va);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void xbox_HeapFree(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
@@ -3347,14 +3560,16 @@ void xbox_HeapFree(uint32_t xbox_va)
         if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
             g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
             g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+            memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i + 2],
+                    (size_t)(g_heap_block_count - i - 2) * sizeof(g_heap_blocks[0]));
+            g_heap_block_count--;
         }
         if (i > 0 && g_heap_blocks[i - 1].free &&
             g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
             g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
+            memmove(&g_heap_blocks[i], &g_heap_blocks[i + 1],
+                    (size_t)(g_heap_block_count - i - 1) * sizeof(g_heap_blocks[0]));
+            g_heap_block_count--;
         }
         return;
     }

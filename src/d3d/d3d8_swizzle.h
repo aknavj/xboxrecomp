@@ -510,9 +510,9 @@ static inline int d3d8_format_is_swizzled(uint32_t fmt)
         fmt == 0x58)   /* CTX1 */
         return 0;
 
-    /* Index/depth formats (not swizzled) */
+    /* Index and remaining depth formats; D16 textures use Morton addressing. */
     if (fmt == 101 || fmt == 102 ||  /* INDEX16/32 */
-        fmt == 0x2A || fmt == 0x2B || fmt == 0x2C || fmt == 0x2D ||  /* D24S8/F24S8/D16/F16 */
+        fmt == 0x2A || fmt == 0x2B || fmt == 0x2D ||  /* D24S8/F24S8/F16 */
         fmt == 0x54 || fmt == 0x55 || fmt == 0x56)  /* D24X8/D24FS8/D32 */
         return 0;
 

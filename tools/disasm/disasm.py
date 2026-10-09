@@ -195,7 +195,7 @@ class Disassembler:
                 # used as a `this` pointer.
                 covering = self.engine.instruction_covering(addr)
                 if covering is not None:
-                    # ...unless the seed decodes as a function prologue, in
+                    # ...unless the seed has a prologue or padded tail jump, in
                     # which case the sweep is the one out of phase. It drifts
                     # whenever it walks zero padding or a data table as
                     # instructions and runs off the end into real code:
@@ -210,7 +210,10 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    # A jump table can likewise swallow the first byte of a
+                    # padded, single-jump teardown thunk with no prologue.
+                    if (self.engine.probes_as_prologue(addr)
+                            or self.engine.probes_as_padded_tail_thunk(addr)):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(

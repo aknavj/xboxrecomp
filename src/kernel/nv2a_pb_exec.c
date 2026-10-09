@@ -37,6 +37,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "../d3d/nv2a_shader_cpu.h"
+#include "../d3d/nv2a_texture_depth.h"
 #ifdef _WIN32
 #include "nv2a_gpu.h"
 static void flush_for_reason(Nv2aGpuSyncReason reason)
@@ -288,6 +289,7 @@ static struct {
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
+    uint32_t clear_horizontal, clear_vertical, clear_rectangle_valid;
     uint32_t window_clip_valid, window_clip_type;
     uint32_t window_clip_horizontal[8], window_clip_vertical[8];
     uint32_t clear_color;
@@ -304,6 +306,7 @@ static struct {
     uint32_t combiner_control, shader_stage_program, transform_execution_mode;
     uint32_t shader_clip_mode, shader_other_stage_input;
     uint32_t shader_dot_mapping;
+    uint32_t shadow_depth_function;
     float shader_eye_vector[3];
     uint32_t shader_eye_vector_valid;
     uint32_t vp_program[136][4], vp_valid[136];
@@ -345,6 +348,8 @@ static struct {
     uint32_t state_shader_runs, state_shader_failures;
     double raster_seconds;
     uint64_t gpu_attribute_fetches, gpu_attribute_skips, gpu_zero_bytes_saved;
+    uint64_t gpu_prepared_float_fetches;
+    uint32_t gpu_input_mask, gpu_input_mask_valid;
     double gpu_prepare_seconds, gpu_submit_seconds;
     uint32_t gpu_batches, cpu_batches;
     int combiners_configured;
@@ -392,6 +397,95 @@ static int ramht_instance(uint32_t handle, uint32_t *instance)
 failure:
     fprintf(stderr, "[GPU] RAMHT object unavailable: handle 0x%08X\n", handle);
     return 0;
+}
+
+typedef struct PbSurface2d {
+    uint32_t instance, source_dma, destination_dma, format, pitch, source_offset, destination_offset;
+    uint32_t surface_handle, operation, source_point, destination_point;
+    uint32_t valid;
+    struct PbSurface2d *next;
+} PbSurface2d;
+static PbSurface2d *surfaces_2d;
+static struct {
+    uint32_t class_id, instance;
+} subchannel_objects[8];
+static uint64_t blit_copies, blit_bytes;
+
+static PbSurface2d *surface_2d(uint32_t instance)
+{
+    for (PbSurface2d *surface = surfaces_2d; surface; surface = surface->next)
+        if (surface->instance == instance) return surface;
+    PbSurface2d *surface = (PbSurface2d *)calloc(1, sizeof *surface);
+    if (!surface) {
+        fprintf(stderr, "[GPU] 2D object state allocation failed\n");
+        fflush(stderr); _Exit(EXIT_FAILURE);
+    }
+    surface->instance = instance;
+    surface->next = surfaces_2d;
+    surfaces_2d = surface;
+    return surface;
+}
+
+static uint8_t *blit_dma_pointer(uint32_t handle, uint64_t offset, uint64_t bytes)
+{
+    uint32_t instance;
+    if (!ramht_instance(handle, &instance)) return NULL;
+    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + instance, 12);
+    if (!descriptor) return NULL;
+    uint32_t flags = descriptor[0], dma_class = flags & 0xFFFu, target = flags & 0x30000u;
+    uint64_t limit = (uint64_t)descriptor[1] + 1;
+    uint64_t address = (descriptor[2] & 0xFFFFF000u) + (flags >> 20);
+    if ((dma_class != 2 && dma_class != 3 && dma_class != 0x3D) ||
+        (target != 0 && target != 0x20000u) || offset > limit || bytes > limit - offset ||
+        bytes > UINT32_MAX) return NULL;
+    return xbox_DmaPhysicalPointer(address + offset, (uint32_t)bytes);
+}
+
+static void image_blit(uint32_t subch, uint32_t size)
+{
+    uint32_t instance, width = size & 65535u, height = size >> 16;
+    PbSurface2d *blit = surface_2d(subchannel_objects[subch].instance);
+    if (!width || !height) return;
+    if (!ramht_instance(blit->surface_handle, &instance)) goto failure;
+    PbSurface2d *surface = surface_2d(instance);
+    uint32_t bytes = surface->format == 1 ? 1 : surface->format == 4 ? 2 :
+        surface->format == 6 || surface->format == 7 || surface->format == 0xA || surface->format == 0xB ? 4 : 0;
+    uint32_t source_pitch = surface->pitch & 65535u, destination_pitch = surface->pitch >> 16;
+    uint32_t source_x = blit->source_point & 65535u;
+    uint32_t source_y = blit->source_point >> 16;
+    uint32_t destination_x = blit->destination_point & 65535u;
+    uint32_t destination_y = blit->destination_point >> 16;
+    if (blit->operation != 3 || (surface->valid & 15u) != 15u || !bytes ||
+        (uint64_t)(source_x + width) * bytes > source_pitch ||
+        (uint64_t)(destination_x + width) * bytes > destination_pitch) goto failure;
+    uint64_t row_bytes = (uint64_t)width * bytes;
+    uint64_t source_offset = surface->source_offset + (uint64_t)source_y * source_pitch + (uint64_t)source_x * bytes;
+    uint64_t destination_offset = surface->destination_offset + (uint64_t)destination_y * destination_pitch +
+                                  (uint64_t)destination_x * bytes;
+    uint64_t source_span = (uint64_t)(height - 1) * source_pitch + row_bytes;
+    uint64_t destination_span = (uint64_t)(height - 1) * destination_pitch + row_bytes;
+    uint8_t *source = blit_dma_pointer(surface->source_dma, source_offset, source_span);
+    uint8_t *destination = blit_dma_pointer(surface->destination_dma, destination_offset, destination_span);
+    if (!source || !destination || row_bytes * height > SIZE_MAX) goto failure;
+    int overlaps = (uintptr_t)source < (uintptr_t)destination + destination_span &&
+                   (uintptr_t)destination < (uintptr_t)source + source_span;
+    uint8_t *snapshot = overlaps ? (uint8_t *)malloc((size_t)(row_bytes * height)) : NULL;
+    if (overlaps && !snapshot) goto failure;
+    flush_for_reason(NV2A_GPU_SYNC_EXTERNAL);
+    if (overlaps)
+        for (uint32_t row = 0; row < height; row++)
+            memcpy(snapshot + (size_t)row * (size_t)row_bytes, source + (size_t)row * source_pitch, (size_t)row_bytes);
+    for (uint32_t row = 0; row < height; row++)
+        memcpy(destination + (size_t)row * destination_pitch,
+               overlaps ? snapshot + (size_t)row * (size_t)row_bytes : source + (size_t)row * source_pitch,
+               (size_t)row_bytes);
+    free(snapshot);
+    blit_copies++; blit_bytes += row_bytes * height;
+    return;
+failure:
+    fprintf(stderr, "[GPU] 2D blit failed: subchannel %u surface handle %08X operation %u size %08X\n",
+            subch, blit->surface_handle, blit->operation, size);
+    fflush(stderr); _Exit(EXIT_FAILURE);
 }
 
 static void semaphore_release(uint32_t value)
@@ -540,6 +634,16 @@ static uint32_t vertex_attribute_bytes(const VertexAttr *a)
     }
 }
 
+static void copy_float_attribute(const uint8_t *source, uint32_t bytes, float out[4])
+{
+    switch (bytes) {
+    case 4: memcpy(out, source, 4); break;
+    case 8: memcpy(out, source, 8); break;
+    case 12: memcpy(out, source, 12); break;
+    case 16: memcpy(out, source, 16); break;
+    }
+}
+
 /* Read an array, inline or immediate attribute using the same format decoder. */
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
@@ -621,8 +725,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         out[3] = (float)p[3] / 255.0f;
         return 1;
     case 2:                                  /* float */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = ((const float *)p)[i];
+        copy_float_attribute(p, bytes, out);
         return 1;
     case 4:                                  /* unsigned byte, normalised */
         for (i = 0; i < a->size && i < 4; i++)
@@ -727,7 +830,7 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float uv[3][2], const Nv2aCpuVertex varying[3]);
 
 #ifdef _WIN32
-static int gpu_clear_surface(uint32_t param)
+static int gpu_clear_surface(uint32_t param, uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
     static int enabled = -1;
     Nv2aGpuDraw state = {0};
@@ -737,10 +840,11 @@ static int gpu_clear_surface(uint32_t param)
         const char *setting = getenv("RECOMP_NV2A_NATIVE_CLEARS");
         enabled = !setting || strcmp(setting, "0") != 0;
     }
-    if (!enabled || s_gpu.clip_x || s_gpu.clip_y || !s_gpu.clip_w || !s_gpu.clip_h)
+    if (!enabled || x || y || width != s_gpu.clip_x + s_gpu.clip_w ||
+        height != s_gpu.clip_y + s_gpu.clip_h || !width || !height)
         return 0;
-    state.width = state.clip_width = s_gpu.clip_w;
-    state.height = state.clip_height = s_gpu.clip_h;
+    state.width = state.clip_width = width;
+    state.height = state.clip_height = height;
     state.bytes_per_pixel = surface_bpp();
     state.pitch = s_gpu.pitch;
     state.depth_pitch = s_gpu.depth_pitch;
@@ -777,10 +881,25 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, width;
+    uint32_t left = s_gpu.clip_x, top = s_gpu.clip_y;
+    uint32_t right = left + s_gpu.clip_w, bottom = top + s_gpu.clip_h;
     int native_clear = 0;
 
+    /* Clear registers have inclusive 12-bit endpoints, not drawing clip widths. */
+    if (s_gpu.clear_rectangle_valid & 1u) {
+        left = s_gpu.clear_horizontal & 0xFFFu;
+        uint32_t end = ((s_gpu.clear_horizontal >> 16) & 0xFFFu) + 1;
+        if (end < right) right = end;
+    }
+    if (s_gpu.clear_rectangle_valid & 2u) {
+        top = s_gpu.clear_vertical & 0xFFFu;
+        uint32_t end = ((s_gpu.clear_vertical >> 16) & 0xFFFu) + 1;
+        if (end < bottom) bottom = end;
+    }
+    if (left >= right || top >= bottom) return;
+
 #ifdef _WIN32
-    native_clear = gpu_clear_surface(param);
+    native_clear = gpu_clear_surface(param, left, top, right - left, bottom - top);
 #endif
     if (!native_clear) flush_for_reason(NV2A_GPU_SYNC_CPU_CLEAR);
 
@@ -789,11 +908,11 @@ static void clear_surface(uint32_t param)
         uint32_t depth_bpp = format == 1 ? 2u : format == 2 ? 4u : 0u;
         uint32_t base = dma_resolve(s_gpu.depth_offset);
         if (depth_bpp && !(s_gpu.control0 & 0x1000u) &&
-            s_gpu.depth_pitch >= (s_gpu.clip_x + s_gpu.clip_w) * depth_bpp &&
-            !surface_write_refused(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.depth_pitch, "depth clear")) {
-            for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h; y++) {
+            s_gpu.depth_pitch >= right * depth_bpp &&
+            !surface_write_refused(base, bottom * s_gpu.depth_pitch, "depth clear")) {
+            for (y = top; y < bottom; y++) {
                 uint8_t *row = mem + base + (size_t)y * s_gpu.depth_pitch;
-                for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w; x++) {
+                for (x = left; x < right; x++) {
                     if (depth_bpp == 2) {
                         if (param & 1u) ((uint16_t *)row)[x] = (uint16_t)(s_gpu.depth_clear >> 8);
                     } else {
@@ -807,35 +926,39 @@ static void clear_surface(uint32_t param)
     }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
-    if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0 || s_gpu.clip_x >= s_gpu.pitch / bpp)
+    if (!s_gpu.color_offset || !s_gpu.pitch || bpp == 0 || left >= s_gpu.pitch / bpp)
         return;
-    width = s_gpu.clip_w;
-    if (width > s_gpu.pitch / bpp - s_gpu.clip_x) width = s_gpu.pitch / bpp - s_gpu.clip_x;
+    width = right - left;
+    if (width > s_gpu.pitch / bpp - left) width = s_gpu.pitch / bpp - left;
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  bottom * s_gpu.pitch,
                                   "clear"))
             return;
         s_gpu.color_base = base;
     }
 
-    for (y = 0; !native_clear && y < s_gpu.clip_h; y++) {
+    for (y = top; !native_clear && y < bottom; y++) {
         uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+                     + (size_t)y * s_gpu.pitch;
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+            uint32_t mask = ((param & 0x10u) ? 0x00FF0000u : 0) | ((param & 0x20u) ? 0x0000FF00u : 0) |
+                            ((param & 0x40u) ? 0x000000FFu : 0) | ((param & 0x80u) ? 0xFF000000u : 0);
+            uint32_t *p = (uint32_t *)row + left;
             for (x = 0; x < width; x++)
-                p[x] = s_gpu.clear_color;
+                p[x] = (p[x] & ~mask) | (s_gpu.clear_color & mask);
         } else if (bpp == 2) {
             /* The clear value is always given as A8R8G8B8; a 16-bit surface
              * takes the same colour reduced to 5:6:5. */
             uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
                                   | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+            uint16_t mask = (uint16_t)(((param & 0x10u) ? 0xF800u : 0) |
+                                      ((param & 0x20u) ? 0x07E0u : 0) | ((param & 0x40u) ? 0x001Fu : 0));
+            uint16_t *p = (uint16_t *)row + left;
             for (x = 0; x < width; x++)
-                p[x] = v;
+                p[x] = (uint16_t)((p[x] & ~mask) | (v & mask));
         }
     }
     s_gpu.clears++;
@@ -1019,7 +1142,8 @@ static uint32_t texture_bytes_per_pixel(uint32_t fmt)
     switch (linear_twin(fmt)) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
     case 0x10: case 0x11: case 0x16: case 0x17: case 0x1C: case 0x1D: case 0x20:
-    case 0x24: case 0x25: return 2;
+    case 0x24: case 0x25: case 0x2C: case 0x30: return 2;
+    case 0x2E: return 4;
     case 0x13: case 0x1B: case 0x1F: return 1;
     default: return 0;
     }
@@ -1416,6 +1540,42 @@ static void present_pvideo_overlay(uint32_t destination)
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
+static int sample_depth_point(const Texture *texture, int32_t x, int32_t y, float *depth)
+{
+    uint32_t bytes = nv_texture_depth_bytes(texture->color);
+    uint64_t span = texture->color == 0x2C ? (uint64_t)texture->width * texture->height * bytes :
+        (uint64_t)texture->pitch * texture->height;
+    if (!texture->valid || !bytes || !texture->width || !texture->height ||
+        texture->addr_u > 5 || texture->addr_v > 5 ||
+        (uint64_t)physical_alias(texture->offset) + span > XBOX_CONTIG_SIZE) return 0;
+    if ((texture->addr_u >= 4 && (x < 0 || (uint32_t)x >= texture->width)) ||
+        (texture->addr_v >= 4 && (y < 0 || (uint32_t)y >= texture->height))) {
+        *depth = (float)((texture->border_color >> 16) & 255u) / 255.0f;
+        return 1;
+    }
+    return nv_texture_depth_texel((const uint8_t *)xbox_GetMemoryOffset() + texture->offset, span,
+        texture->width, texture->height, texture->pitch, texture->color,
+        wrap_coord(x, texture->width, texture->addr_u), wrap_coord(y, texture->height, texture->addr_v), depth);
+}
+
+static int sample_depth_filtered(const Texture *texture, float x, float y, float *depth)
+{
+    if (texture->addr_u == 5) x = nv_cpu_clamp(x, 0, (float)texture->width);
+    if (texture->addr_v == 5) y = nv_cpu_clamp(y, 0, (float)texture->height);
+    if (((texture->filter >> 24) & 15u) != 2)
+        return sample_depth_point(texture, nv_cpu_floor_coordinate(x), nv_cpu_floor_coordinate(y), depth);
+    x -= 0.5f; y -= 0.5f;
+    int32_t left = nv_cpu_floor_coordinate(x), top = nv_cpu_floor_coordinate(y);
+    float values[4], horizontal = x - left, vertical = y - top;
+    if (!sample_depth_point(texture, left, top, &values[0]) ||
+        !sample_depth_point(texture, left + 1, top, &values[1]) ||
+        !sample_depth_point(texture, left, top + 1, &values[2]) ||
+        !sample_depth_point(texture, left + 1, top + 1, &values[3])) return 0;
+    *depth = (values[0] + (values[1] - values[0]) * horizontal) * (1 - vertical) +
+             (values[2] + (values[3] - values[2]) * horizontal) * vertical;
+    return 1;
+}
+
 static int shader_fragment(const Nv2aCpuVertex vertices[3], const float weights[3], int fast_mode, uint32_t *argb)
 {
     float diffuse[4] = {0}, specular[4] = {0}, textures[4][4] = {{0}}, result[4];
@@ -1447,7 +1607,8 @@ static int shader_fragment(const Nv2aCpuVertex vertices[3], const float weights[
             memcpy(textures[stage], coordinate, sizeof coordinate);
             continue;
         }
-        if (mode != 1 || coordinate[3] == 0.0f) return 0;
+        int depth_texture = nv_texture_depth_bytes(texture->color) != 0;
+        if ((mode != 1 && !(mode == 2 && depth_texture)) || coordinate[3] == 0.0f) return 0;
         coordinate[0] /= coordinate[3]; coordinate[1] /= coordinate[3];
         if (tex_size_from_format(texture->color)) {
             coordinate[0] *= texture->width;
@@ -1455,8 +1616,19 @@ static int shader_fragment(const Nv2aCpuVertex vertices[3], const float weights[
         }
         if (!nv_cpu_finite(coordinate[0]) || !nv_cpu_finite(coordinate[1]) ||
             fabsf(coordinate[0]) > 2147480000.0f || fabsf(coordinate[1]) > 2147480000.0f) return 0;
-        if (!sample_texture_bound(texture, (uint32_t)nv_cpu_floor_coordinate(coordinate[0]),
-                                   (uint32_t)nv_cpu_floor_coordinate(coordinate[1]), &texel)) return 0;
+        if (depth_texture) {
+            float sampled, maximum = nv_texture_depth_max(texture->color);
+            float reference = mode == 2 ? nv_cpu_clamp(coordinate[2] / coordinate[3], 0, maximum) : 0;
+            if (s_gpu.shadow_depth_function > 7 || (texture->raw_format & 4u) ||
+                ((texture->raw_format >> 4) & 15u) == 3u || (texture->filter >> 28) ||
+                (texture->control0_valid && (texture->control0 & 3u)) ||
+                ((texture->filter >> 16) & 255u) > 6 || ((texture->filter >> 24) & 15u) > 2 ||
+                !nv_cpu_finite(reference) ||
+                !sample_depth_filtered(texture, coordinate[0], coordinate[1], &sampled)) return 0;
+            texel = nv_texture_depth_compare(s_gpu.shadow_depth_function, sampled * maximum, reference) ?
+                0xFFFFFFFFu : 0;
+        } else if (!sample_texture_bound(texture, (uint32_t)nv_cpu_floor_coordinate(coordinate[0]),
+                                         (uint32_t)nv_cpu_floor_coordinate(coordinate[1]), &texel)) return 0;
         if (fast_mode == 1) { *argb = texel; return 1; }
         if (fast_mode == 3) {
             *argb = (texel & 0x00FFFFFFu) |
@@ -2074,6 +2246,73 @@ static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t hor
 
 static uint32_t gpu_vertex_tags[65536], gpu_vertex_offsets[65536], gpu_vertex_keys[65536], gpu_vertex_serial;
 static uint32_t gpu_attribute_mask;
+typedef struct {
+    const uint8_t *base;
+    uint64_t limit;
+    uint32_t bytes;
+    uint32_t constant;
+    int present;
+    float value[4];
+} GpuPreparedAttribute;
+static GpuPreparedAttribute gpu_prepared_attributes[NV_VERTEX_ATTRS];
+static uint32_t gpu_live_attributes[NV_VERTEX_ATTRS], gpu_live_attribute_count;
+static uint32_t gpu_color_attribute, gpu_texture_attribute;
+
+static void gpu_prepare_attributes(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_NV2A_VERTEX_PREPARED");
+        enabled = !value || strcmp(value, "0") != 0;
+    }
+    gpu_live_attribute_count = 0;
+    gpu_color_attribute = (uint32_t)(color_attr() - s_gpu.attr);
+    gpu_texture_attribute = (uint32_t)(texcoord_attr() - s_gpu.attr);
+    for (uint32_t attribute = 0; attribute < NV_VERTEX_ATTRS; attribute++) {
+        const VertexAttr *a = &s_gpu.attr[attribute];
+        GpuPreparedAttribute *prepared = &gpu_prepared_attributes[attribute];
+        prepared->bytes = 0;
+        prepared->constant = 0;
+        if (gpu_attribute_mask & (1u << attribute))
+            gpu_live_attributes[gpu_live_attribute_count++] = attribute;
+        if (!enabled || s_gpu.immediate_active) continue;
+        if (!a->size || !a->stride || (!s_gpu.inline_active && !a->offset)) {
+            prepared->present = fetch_attr(a, 0, prepared->value);
+            prepared->constant = 1;
+            continue;
+        }
+        if (a->type != 2) continue;
+        prepared->bytes = vertex_attribute_bytes(a);
+        if (s_gpu.inline_active) {
+            prepared->base = (const uint8_t *)s_gpu.inline_buf;
+            prepared->limit = (uint64_t)s_gpu.inline_count * 4;
+        } else {
+            prepared->base = (const uint8_t *)xbox_GetMemoryOffset();
+            prepared->limit = a->offset >= XBOX_CONTIG_BASE && a->offset < XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE ?
+                (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE :
+                (uint64_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram) * (1 + XBOX_NUM_MIRRORS);
+            if (prepared->limit > (uint64_t)UINT32_MAX + 1u) prepared->limit = (uint64_t)UINT32_MAX + 1u;
+        }
+    }
+}
+
+static int gpu_fetch_attribute(uint32_t attribute, uint32_t index, float out[4])
+{
+    const GpuPreparedAttribute *prepared = &gpu_prepared_attributes[attribute];
+    const VertexAttr *a = &s_gpu.attr[attribute];
+    if (prepared->constant) {
+        memcpy(out, prepared->value, sizeof prepared->value);
+        return prepared->present;
+    }
+    if (!prepared->bytes) return fetch_attr(a, index, out);
+    uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
+    if (at + prepared->bytes > prepared->limit)
+        return fetch_attr(a, index, out);
+    out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+    copy_float_attribute(prepared->base + (size_t)at, prepared->bytes, out);
+    s_gpu.gpu_prepared_float_fetches++;
+    return 1;
+}
 
 static void gpu_begin_chunk(void)
 {
@@ -2124,27 +2363,27 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
             destination = &gpu_vertices[(*count)++];
             if ((s_gpu.transform_execution_mode & 3u) == 2u) {
                 memset(destination, 0, sizeof *destination);
-                for (stage = 0; stage < 16; stage++) {
-                    if (gpu_attribute_mask & (1u << stage)) {
-                        fetch_attr(&s_gpu.attr[stage], indices[vertex], destination->attributes[stage]);
-                        s_gpu.gpu_attribute_fetches++;
-                    } else s_gpu.gpu_attribute_skips++;
+                for (stage = 0; stage < gpu_live_attribute_count; stage++) {
+                    uint32_t attribute = gpu_live_attributes[stage];
+                    gpu_fetch_attribute(attribute, indices[vertex], destination->attributes[attribute]);
                 }
+                s_gpu.gpu_attribute_fetches += gpu_live_attribute_count;
+                s_gpu.gpu_attribute_skips += NV_VERTEX_ATTRS - gpu_live_attribute_count;
                 memcpy(destination->position, destination->attributes[0], sizeof destination->position);
             } else {
                 memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
                 s_gpu.gpu_zero_bytes_saved += sizeof destination->attributes;
-                fetch_attr(&s_gpu.attr[0], indices[vertex], destination->position);
-                if (!fetch_attr(color_attr(), indices[vertex], destination->diffuse))
+                gpu_fetch_attribute(0, indices[vertex], destination->position);
+                if (!gpu_fetch_attribute(gpu_color_attribute, indices[vertex], destination->diffuse))
                     nv_cpu_unpack_argb(0xFFFFFFFFu, destination->diffuse);
-                fetch_attr(&s_gpu.attr[4], indices[vertex], destination->specular);
+                gpu_fetch_attribute(4, indices[vertex], destination->specular);
                 float fog_attribute[4] = {0,0,0,1};
-                fetch_attr(&s_gpu.attr[5], indices[vertex], fog_attribute);
+                gpu_fetch_attribute(5, indices[vertex], fog_attribute);
                 destination->fog_coordinate = fog_attribute[0];
-                fetch_attr(&s_gpu.attr[2], indices[vertex], destination->normal);
-                fetch_attr(&s_gpu.attr[1], indices[vertex], destination->weights);
+                gpu_fetch_attribute(2, indices[vertex], destination->normal);
+                gpu_fetch_attribute(1, indices[vertex], destination->weights);
                 for (stage = 0; stage < 4; stage++)
-                    fetch_attr(stage ? &s_gpu.attr[9 + stage] : texcoord_attr(), indices[vertex], destination->texture[stage]);
+                    gpu_fetch_attribute(stage ? 9 + stage : gpu_texture_attribute, indices[vertex], destination->texture[stage]);
             }
         }
         s_gpu.shader_vertices += vertex_count;
@@ -2222,6 +2461,7 @@ static int gpu_raster_batch(void)
     state.shader_clip_mode = s_gpu.shader_clip_mode;
     state.shader_other_stage_input = s_gpu.shader_other_stage_input;
     state.shader_dot_mapping = s_gpu.shader_dot_mapping;
+    state.shadow_depth_function = s_gpu.shadow_depth_function;
     memcpy(state.shader_eye_vector, s_gpu.shader_eye_vector, sizeof state.shader_eye_vector);
     state.shader_eye_vector_valid = s_gpu.shader_eye_vector_valid;
     if ((s_gpu.transform_execution_mode & 3u) == 2u) {
@@ -2233,8 +2473,11 @@ static int gpu_raster_batch(void)
             fetch_all = value && *value && strcmp(value, "0") != 0;
         }
         /* Position is retained for the native vertex snapshot even if the program does not read it. */
-        gpu_attribute_mask = fetch_all ? 0xFFFFu :
-            nv_cpu_vertex_input_mask(s_gpu.vp_program, s_gpu.vp_valid, s_gpu.vp_start) | 1u;
+        if (!fetch_all && !s_gpu.gpu_input_mask_valid) {
+            s_gpu.gpu_input_mask = nv_cpu_vertex_input_mask(s_gpu.vp_program, s_gpu.vp_valid, s_gpu.vp_start) | 1u;
+            s_gpu.gpu_input_mask_valid = 1;
+        }
+        gpu_attribute_mask = fetch_all ? 0xFFFFu : s_gpu.gpu_input_mask;
     } else if ((s_gpu.transform_execution_mode & 3u) == 0u && s_gpu.composite_valid == 0xFFFFu) {
         state.fixed_transform = 1; state.vertex_constants = s_gpu.vp_constants;
         state.lighting_enable = s_gpu.lighting_enable; state.specular_enable = s_gpu.specular_enable;
@@ -2296,7 +2539,8 @@ static int gpu_raster_batch(void)
         if (!texture->valid) return gpu_batch_rejected("invalid texture binding");
         if (((texture->raw_format >> 4) & 15u) == 3u)
             binding->depth = 1u << (texture->raw_format >> 28);
-        if ((mode == 2) != (binding->depth != 0) || (binding->depth && (texture->raw_format & 4u)))
+        if ((!nv_texture_depth_bytes(texture->color) && (mode == 2) != (binding->depth != 0)) ||
+            (binding->depth && (texture->raw_format & 4u)))
             return gpu_batch_rejected("projective volume texture dimensionality");
         binding->source = memory + texture->offset; binding->width = texture->width; binding->height = texture->height;
         binding->pitch = texture->pitch; binding->format = texture->color; binding->linear = !tex_size_from_format(texture->color);
@@ -2364,6 +2608,7 @@ static int gpu_raster_batch(void)
         if (!bytes || (uint64_t)physical_alias(texture->offset) + bytes > XBOX_CONTIG_SIZE) return gpu_batch_rejected("texture memory extent");
         binding->source_bytes = (uint32_t)bytes;
     }
+    gpu_prepare_attributes();
     switch (s_gpu.prim) {
     case NV_PRIM_POINTS:
         for (index = 0; index < s_gpu.idx_count; index++)
@@ -3022,7 +3267,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (xbox_Nv2aNativeFencesEnabled() && subch < 8) {
-        static uint32_t classes[8];
         if (method == 0) {
             uint32_t instance;
             if (!ramht_instance(param, &instance)) {
@@ -3034,10 +3278,32 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
                 _Exit(EXIT_FAILURE);
             }
-            classes[subch] = *object & 0xFFFu;
+            subchannel_objects[subch].class_id = *object & 0xFFFu;
+            subchannel_objects[subch].instance = instance;
             return;
         }
-        if (classes[subch] == 0x44u && method == 0x0310) {
+        if (subchannel_objects[subch].class_id == 0x62u) {
+            PbSurface2d *surface = surface_2d(subchannel_objects[subch].instance);
+            switch (method) {
+            case 0x0184: surface->source_dma = param; surface->valid |= 1; return;
+            case 0x0188: surface->destination_dma = param; surface->valid |= 2; return;
+            case 0x0300: surface->format = param; surface->valid |= 4; return;
+            case 0x0304: surface->pitch = param; surface->valid |= 8; return;
+            case 0x0308: surface->source_offset = param; surface->valid |= 16; return;
+            case 0x030C: surface->destination_offset = param; surface->valid |= 32; return;
+            }
+        }
+        if (subchannel_objects[subch].class_id == 0x9Fu) {
+            PbSurface2d *blit = surface_2d(subchannel_objects[subch].instance);
+            switch (method) {
+            case 0x019C: blit->surface_handle = param; return;
+            case 0x02FC: blit->operation = param; return;
+            case 0x0300: blit->source_point = param; return;
+            case 0x0304: blit->destination_point = param; return;
+            case 0x0308: image_blit(subch, param); return;
+            }
+        }
+        if (subchannel_objects[subch].class_id == 0x44u && method == 0x0310) {
             volatile uint32_t *color = xbox_Nv2aRegisterPointer(0x400B10, 4);
             if (!color) {
                 fflush(stderr);
@@ -3083,6 +3349,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.combiner_control = param;
         s_gpu.combiners.control = param;
         s_gpu.combiners_configured = 1;
+        return;
+    } else if (method == 0x1E6C) {
+        if (param > 7) {
+            note_unhandled(subch, method, param);
+            return;
+        }
+        s_gpu.shadow_depth_function = param;
         return;
     } else if (method == 0x1E70) {
         s_gpu.shader_stage_program = param;
@@ -3316,6 +3589,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (method == 0x1EA0) {
         s_gpu.vp_start = param;
+        s_gpu.gpu_input_mask_valid = 0;
         return;
     }
     if (method == 0x1EA4) {
@@ -3353,6 +3627,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.vp_load < 136) {
             s_gpu.vp_program[s_gpu.vp_load][component] = param;
             s_gpu.vp_valid[s_gpu.vp_load] |= 1u << component;
+            s_gpu.gpu_input_mask_valid = 0;
         }
         s_gpu.vp_words++;
         if (component == 3)
@@ -3428,6 +3703,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_CLIP_VERTICAL:
         s_gpu.clip_y = param & 0xFFFF;
         s_gpu.clip_h = (param >> 16) & 0xFFFF;
+        break;
+    case 0x1D98:
+        s_gpu.clear_horizontal = param;
+        s_gpu.clear_rectangle_valid |= 1u;
+        break;
+    case 0x1D9C:
+        s_gpu.clear_vertical = param;
+        s_gpu.clear_rectangle_valid |= 2u;
         break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
@@ -3837,6 +4120,10 @@ void nv2a_pb_exec_report(void)
             (double)s_gpu.gpu_zero_bytes_saved / (1024.0 * 1024 * 1024));
     fprintf(stderr, "[GPU-D3D11] executor time: preparation %.3fs backend %.3fs\n",
             s_gpu.gpu_prepare_seconds, s_gpu.gpu_submit_seconds);
+    fprintf(stderr, "[GPU-D3D11] prepared vertex fetch: %llu float array attributes\n",
+            (unsigned long long)s_gpu.gpu_prepared_float_fetches);
+    fprintf(stderr, "[GPU-D3D11] auxiliary blits: %llu copies, %.3f MiB\n",
+            (unsigned long long)blit_copies, (double)blit_bytes / 1048576.0);
     nv2a_gpu_report();
     xbox_Nv2aSoftwareMethodReport();
 #ifdef _WIN32
